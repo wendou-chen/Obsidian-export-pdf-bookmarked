@@ -1,8 +1,19 @@
 # Bookmarked PDF Export
 
+English | [简体中文](README.zh-CN.md)
+
 Export Obsidian notes to PDFs with native bookmarks generated from Markdown headings.
 
 This plugin turns a note's heading structure into a real PDF outline tree, so PDF readers can show the document outline/bookmarks panel immediately after export. It also keeps the original outline workflow: you can copy or export a note outline as Markdown.
+
+## Primary Workflows
+
+This plugin was built for two main workflows:
+
+- Organizing postgraduate entrance exam syllabi and study materials. Long Markdown notes can be exported as book-like PDFs whose headings become clickable PDF bookmarks, which makes review documents easier to navigate.
+- Working together with my note repository, [MBA Study Notes](https://github.com/wendou-chen/MBA-Study-Notes). The notes live and evolve in Obsidian, while this plugin turns selected notes, outlines, and study packs into shareable bookmarked PDFs.
+
+Used together, the note repository provides the structured knowledge base, and this plugin provides a clean export path from Markdown structure to readable PDF documents.
 
 ## Features
 
@@ -29,11 +40,9 @@ Obsidian can export notes to PDF, and several community plugins can improve expo
 
 This plugin focuses on that narrow job: keep writing in Markdown, export to PDF, and preserve the outline as clickable PDF bookmarks.
 
-## Plugin Survey
+## Plugin Positioning
 
-The current local investigation found one plugin in this vault that provides native PDF bookmarks:
-
-| Plugin | PDF export | Native PDF bookmarks | Notes |
+| Tool or approach | PDF export | Native PDF bookmarks | Notes |
 | --- | --- | --- | --- |
 | Bookmarked PDF Export (`outline-markdown-export`) | Yes | Yes | Writes `/Outlines` and sets `/PageMode /UseOutlines` with `pdf-lib`. |
 | Obsidian core PDF export | Yes | Not reliably from Markdown headings | Useful as a source PDF for the "add bookmarks" command. |
