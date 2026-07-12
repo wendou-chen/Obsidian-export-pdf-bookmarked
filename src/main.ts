@@ -19,10 +19,17 @@ import {
   getOutlineExportPath,
   getPdfBookmarkHeadings,
   getPrintableBookmarkedPdfMarkdown,
+  getPrintableSectionPdfMarkdown,
+  getSectionExportPaths,
+  locateMarkdownSection,
+  parseMarkdownHeadingRanges,
+  sliceMarkdownSection,
   isPdfTocHeadingTitle,
   mapPdfBookmarkHeadingsToPages,
   needsSyntheticPdfRootHeading,
+  needsSectionOrdinalSuffix,
   parseMarkdownHeadings,
+  type MarkdownHeadingRange,
   type OutlineHeading,
   type PdfBookmarkTarget,
 } from "./outlineMarkdown";
@@ -32,6 +39,8 @@ import {
   PDF_PRINT_ANCHOR_URI_PREFIX,
   type PdfAnchorTarget,
 } from "./pdfOutline";
+import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
+import { SerialTaskQueue } from "./serialTaskQueue";
 
 type CurrentFileAction = "copy" | "export" | "bookmarked-pdf" | "pdf";
 
@@ -62,6 +71,7 @@ const PDF_PRINT_OPTIONS: Record<string, unknown> = {
 };
 
 export default class OutlineMarkdownExportPlugin extends Plugin {
+  private readonly pdfPrintQueue = new SerialTaskQueue();
   async onload(): Promise<void> {
     this.addCommand({
       id: "copy-current-outline-markdown",
@@ -84,7 +94,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
 
       this.addCommand({
         id: "add-bookmarks-to-native-pdf",
-        name: "为原生导出的 PDF 添加书签",
+        name: "给已有 PDF 注入书签",
         checkCallback: (checking) => this.handleCurrentFileCommand(checking, "pdf"),
       });
     }
@@ -124,16 +134,6 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
               .setSection("outline-markdown-export")
               .onClick(() => {
                 void this.exportBookmarkedPdfForFile(file);
-              }),
-          );
-
-          menu.addItem((item) =>
-            item
-              .setTitle("为原生 PDF 添加书签")
-              .setIcon("bookmark")
-              .setSection("outline-markdown-export")
-              .onClick(() => {
-                void this.addBookmarksToNativePdfForFile(file);
               }),
           );
         }
@@ -176,19 +176,91 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
                 void this.exportBookmarkedPdfForFile(file);
               }),
           );
-
-          menu.addItem((item) =>
-            item
-              .setTitle("为原生 PDF 添加书签")
-              .setIcon("bookmark")
-              .setSection("outline-markdown-export")
-              .onClick(() => {
-                void this.addBookmarksToNativePdfForFile(file);
-              }),
-          );
         }
       }),
     );
+
+    registerOutlineSectionMenus(this, {
+      copy: (selection) => this.copyOutlineSection(selection),
+      exportMarkdown: (selection) => this.exportOutlineSectionMarkdown(selection),
+      exportPdf: (selection) => this.exportOutlineSectionPdf(selection),
+    });
+  }
+
+  private async resolveSelectedSection(selection: OutlineHeadingSelection): Promise<{
+    section: string;
+    selected: MarkdownHeadingRange;
+    appendOrdinal: boolean;
+  } | null> {
+    const markdown = await this.getMarkdownContent(selection.file);
+    const headings = parseMarkdownHeadingRanges(markdown);
+    const selected = locateMarkdownSection(headings, selection);
+    if (!selected) {
+      new Notice("标题已变化或无法精确定位，请重新右击该大纲条目");
+      return null;
+    }
+    return {
+      section: sliceMarkdownSection(markdown, headings, selected),
+      selected,
+      appendOrdinal: needsSectionOrdinalSuffix(headings, selected),
+    };
+  }
+
+  private async copyOutlineSection(selection: OutlineHeadingSelection): Promise<void> {
+    try {
+      const resolved = await this.resolveSelectedSection(selection);
+      if (!resolved) return;
+      await navigator.clipboard.writeText(resolved.section);
+      new Notice(`已复制此节 Markdown：${resolved.selected.heading}`);
+    } catch (error) {
+      console.error("Failed to copy outline section", error);
+      new Notice("复制此节 Markdown 失败");
+    }
+  }
+
+  private async exportOutlineSectionMarkdown(selection: OutlineHeadingSelection): Promise<void> {
+    try {
+      const resolved = await this.resolveSelectedSection(selection);
+      if (!resolved) return;
+      const path = normalizePath(getSectionExportPaths(
+        selection.file.path, resolved.selected, resolved.appendOrdinal,
+      ).markdownPath);
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      const output = `${resolved.section.replace(/(?:\r?\n)*$/, "")}\n`;
+      if (existing instanceof TFile) await this.app.vault.modify(existing, output);
+      else if (existing) throw new Error(`目标路径不是文件：${path}`);
+      else await this.app.vault.create(path, output);
+      new Notice(`已导出此节 Markdown：${path}`);
+    } catch (error) {
+      console.error("Failed to export outline section markdown", error);
+      new Notice(`导出此节 Markdown 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async exportOutlineSectionPdf(selection: OutlineHeadingSelection): Promise<void> {
+    if (!Platform.isDesktopApp) {
+      new Notice("此节 PDF 导出仅支持 Obsidian 桌面端");
+      return;
+    }
+    try {
+      const resolved = await this.resolveSelectedSection(selection);
+      if (!resolved) return;
+      const printable = getPrintableSectionPdfMarkdown(resolved.section, selection.file.basename);
+      const printed = await this.printMarkdownToPdf(selection.file, printable);
+      const finalized = await finalizeBookmarkedPdf(printed.pdfBytes, printed.anchors);
+      const path = normalizePath(getSectionExportPaths(
+        selection.file.path, resolved.selected, resolved.appendOrdinal,
+      ).pdfPath);
+      await this.writeBinaryVaultFile(path, this.toArrayBuffer(finalized.bytes));
+      if (finalized.matchedCount > 0) {
+        new Notice(`已导出此节带书签 PDF（${finalized.matchedCount} 个书签）：${path}`);
+      } else {
+        new Notice(`已导出此节 PDF，但未能定位标题锚点，未生成书签：${path}`);
+      }
+    } catch (error) {
+      console.error("Failed to export outline section PDF", error);
+      new Notice(`导出此节带书签 PDF 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private handleCurrentFileCommand(checking: boolean, action: CurrentFileAction): boolean {
@@ -319,7 +391,14 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     }
   }
 
-  private async printMarkdownToPdf(
+  private printMarkdownToPdf(
+    file: TFile,
+    markdown: string,
+  ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
+    return this.pdfPrintQueue.run(() => this.printMarkdownToPdfSerial(file, markdown));
+  }
+
+  private async printMarkdownToPdfSerial(
     file: TFile,
     markdown: string,
   ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
@@ -563,6 +642,15 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     const activeMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (activeMarkdownView?.file?.path === file.path) {
       return activeMarkdownView.getViewData();
+    }
+
+    // If the same file is open in multiple leaves, prefer the active matching view above;
+    // otherwise use the first matching markdown leaf's unsaved snapshot.
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === file.path) {
+        return view.getViewData();
+      }
     }
 
     return this.app.vault.cachedRead(file);

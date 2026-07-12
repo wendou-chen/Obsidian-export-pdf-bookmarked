@@ -79,6 +79,11 @@ export function getPdfBookmarkHeadings(headings: OutlineHeading[]): OutlineHeadi
     ));
 }
 
+export function getPrintableSectionPdfMarkdown(section: string, sourceName: string): string {
+  const title = sourceName.trim() || "Untitled";
+  return `# ${title}\n\n${section.replace(/^(?:\r?\n)+/, "")}`;
+}
+
 export function getPrintableBookmarkedPdfMarkdown(markdown: string, sourceName: string): string {
   if (!needsSyntheticPdfRootHeading(parseMarkdownHeadings(markdown))) {
     return markdown;
@@ -309,37 +314,25 @@ export function locateMarkdownSection(
   headings: MarkdownHeadingRange[],
   selection: MarkdownHeadingSelection,
 ): MarkdownHeadingRange | null {
-  const matchesIdentity = (heading: MarkdownHeadingRange): boolean => (
-    heading.level === selection.level && heading.heading === selection.heading
-  );
+  const identityMatches = headings.filter((heading) =>
+    heading.level === selection.level && heading.heading === selection.heading);
 
   if (Number.isFinite(selection.startOffset)) {
-    const matches = headings.filter((heading) => (
-      matchesIdentity(heading) && heading.startOffset === selection.startOffset
-    ));
-    if (matches.length > 0) {
-      return matches.length === 1 ? matches[0] : null;
+    const exactMatches = identityMatches.filter((heading) => heading.startOffset === selection.startOffset);
+    if (exactMatches.length === 1) {
+      if (Number.isFinite(selection.ordinal) && exactMatches[0].ordinal !== selection.ordinal) {
+        return null;
+      }
+      return exactMatches[0];
     }
+    if (exactMatches.length > 1) return null;
   }
 
-  if (Number.isFinite(selection.ordinal)) {
-    const matches = headings.filter((heading) => (
-      matchesIdentity(heading) && heading.ordinal === selection.ordinal
-    ));
-    if (matches.length > 0) {
-      return matches.length === 1 ? matches[0] : null;
-    }
-  }
-
-  if (Number.isFinite(selection.startLine)) {
-    const startLine = selection.startLine as number;
-    const matches = headings.filter((heading) => (
-      matchesIdentity(heading) && Math.abs(heading.startLine - startLine) <= 2
-    ));
-    return matches.length === 1 ? matches[0] : null;
-  }
-
-  return null;
+  // A stale ordinal must never choose among duplicate headings after edits.
+  if (identityMatches.length !== 1 || !Number.isFinite(selection.startLine)) return null;
+  return Math.abs(identityMatches[0].startLine - (selection.startLine as number)) <= 2
+    ? identityMatches[0]
+    : null;
 }
 
 export function sliceMarkdownSection(
@@ -351,6 +344,39 @@ export function sliceMarkdownSection(
     heading.startOffset > selected.startOffset && heading.level <= selected.level
   ));
   return markdown.slice(selected.startOffset, nextBoundary?.startOffset ?? markdown.length);
+}
+
+export function needsSectionOrdinalSuffix(
+  headings: MarkdownHeadingRange[],
+  selected: Pick<MarkdownHeadingRange, "heading"> & Partial<Pick<MarkdownHeadingRange, "startOffset" | "ordinal">>,
+): boolean {
+  const keys = headings.map((heading) => sectionPathComparisonKey(heading.heading));
+  const append = new Set<number>();
+  for (let index = 0; index < keys.length; index += 1) {
+    if (keys.filter((key) => key === keys[index]).length > 1) append.add(index);
+  }
+
+  // Appending an ordinal can itself collide with an unsuffixed original stem (A/A/A-1).
+  while (true) {
+    const stems = keys.map((key, index) => append.has(index) ? `${key}-${headings[index].ordinal + 1}` : key);
+    const newlyColliding = new Set<number>();
+    for (let index = 0; index < stems.length; index += 1) {
+      if (stems.filter((stem) => stem === stems[index]).length > 1) newlyColliding.add(index);
+    }
+    const previousSize = append.size;
+    for (const index of newlyColliding) append.add(index);
+    if (append.size === previousSize) break;
+  }
+
+  const selectedIndex = headings.findIndex((heading) => heading === selected || (
+    Number.isFinite(selected.startOffset) && heading.startOffset === selected.startOffset &&
+    heading.heading === selected.heading
+  ));
+  return selectedIndex >= 0 ? append.has(selectedIndex) : false;
+}
+
+function sectionPathComparisonKey(heading: string): string {
+  return sanitizeHeadingPathComponent(heading).toLocaleLowerCase("en-US");
 }
 
 export function getSectionExportPaths(

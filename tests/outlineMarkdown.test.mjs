@@ -11,9 +11,29 @@ const tempDir = await mkdtemp(path.join(tmpdir(), "outline-markdown-export-test-
 try {
   const bundlePath = path.join(tempDir, "outlineMarkdown.mjs");
   const pdfBundlePath = path.join(tempDir, "pdfOutline.mjs");
+  const resolverBundlePath = path.join(tempDir, "outlineContextResolver.mjs");
+  const queueBundlePath = path.join(tempDir, "serialTaskQueue.mjs");
   await build({
     entryPoints: [path.join(rootDir, "src/outlineMarkdown.ts")],
     outfile: bundlePath,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    write: true,
+    logLevel: "silent",
+  });
+  await build({
+    entryPoints: [path.join(rootDir, "src/serialTaskQueue.ts")],
+    outfile: queueBundlePath,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    write: true,
+    logLevel: "silent",
+  });
+  await build({
+    entryPoints: [path.join(rootDir, "src/outlineContextResolver.ts")],
+    outfile: resolverBundlePath,
     bundle: true,
     platform: "node",
     format: "esm",
@@ -36,15 +56,19 @@ try {
     getOutlineExportPath,
     getPdfBookmarkHeadings,
     getPrintableBookmarkedPdfMarkdown,
+    getPrintableSectionPdfMarkdown,
     getSectionExportPaths,
     hasPdfOutlines,
     locateMarkdownSection,
     mapPdfBookmarkHeadingsToPages,
     needsSyntheticPdfRootHeading,
+    needsSectionOrdinalSuffix,
     parseMarkdownHeadingRanges,
     parseMarkdownHeadings,
     sliceMarkdownSection,
   } = await import(pathToFileURL(bundlePath).href);
+  const { resolveOutlineHeadingIdentity } = await import(pathToFileURL(resolverBundlePath).href);
+  const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const { addPdfBookmarks, finalizeBookmarkedPdf } = await import(pathToFileURL(pdfBundlePath).href);
 
@@ -569,7 +593,7 @@ try {
   );
   assert.equal(
     locateMarkdownSection(sectionHeadings, { heading: "Repeat", level: 2, ordinal: 1 }),
-    sectionHeadings[1],
+    null,
   );
   assert.equal(
     locateMarkdownSection(sectionHeadings, { heading: "Child", level: 3, startLine: 5 }),
@@ -580,11 +604,92 @@ try {
     null,
   );
 
+  const staleSameHeadings = parseMarkdownHeadingRanges("## Same\nremaining");
+  assert.equal(locateMarkdownSection(staleSameHeadings, {
+    heading: "Same", level: 2, startOffset: 20, startLine: 4, ordinal: 1,
+  }), null);
+  const insertedSameHeadings = parseMarkdownHeadingRanges("## Same\nnew\n\n## Same\nold");
+  assert.equal(locateMarkdownSection(insertedSameHeadings, {
+    heading: "Same", level: 2, startOffset: 0, startLine: 0, ordinal: 1,
+  }), null);
+
   const ambiguousHeadings = parseMarkdownHeadingRanges("## Same\na\nb\nc\n## Same");
   assert.equal(
     locateMarkdownSection(ambiguousHeadings, { heading: "Same", level: 2, startLine: 2 }),
     null,
   );
+
+  assert.equal(
+    getPrintableSectionPdfMarkdown("\n\n  ### Child\nbody\n", "   "),
+    "# Untitled\n\n  ### Child\nbody\n",
+  );
+
+  const collisionHeadings = parseMarkdownHeadingRanges("## A/B\none\n## A:B\ntwo");
+  assert.equal(needsSectionOrdinalSuffix(collisionHeadings, collisionHeadings[0]), true);
+  assert.equal(needsSectionOrdinalSuffix(collisionHeadings, collisionHeadings[1]), true);
+  assert.equal(needsSectionOrdinalSuffix(collisionHeadings, { ...collisionHeadings[1], heading: "Unique" }), false);
+  const caseCollisionHeadings = parseMarkdownHeadingRanges("## Foo\none\n## foo\ntwo");
+  assert.equal(needsSectionOrdinalSuffix(caseCollisionHeadings, caseCollisionHeadings[0]), true);
+  assert.equal(needsSectionOrdinalSuffix(caseCollisionHeadings, caseCollisionHeadings[1]), true);
+
+  const secondaryCollisionHeadings = parseMarkdownHeadingRanges("## A\none\n## A\ntwo\n## A-1\nthree");
+  const secondaryPaths = secondaryCollisionHeadings.map((heading) =>
+    getSectionExportPaths("source.md", heading, needsSectionOrdinalSuffix(secondaryCollisionHeadings, heading)).markdownPath
+      .toLocaleLowerCase("en-US"));
+  assert.equal(new Set(secondaryPaths).size, 3);
+  assert.deepEqual(secondaryPaths, [
+    "source--a-1.section.md", "source--a-2.section.md", "source--a-1-3.section.md",
+  ]);
+
+  const illegalCollisionHeadings = parseMarkdownHeadingRanges("## A/B\none\n## A:B\ntwo\n## A B-1\nthree");
+  const illegalPaths = illegalCollisionHeadings.map((heading) =>
+    getSectionExportPaths("source.md", heading, needsSectionOrdinalSuffix(illegalCollisionHeadings, heading)).markdownPath
+      .toLocaleLowerCase("en-US"));
+  assert.equal(new Set(illegalPaths).size, 3);
+
+  let activeTasks = 0;
+  let maxActiveTasks = 0;
+  const queue = new SerialTaskQueue();
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstTask = queue.run(async () => {
+    activeTasks += 1; maxActiveTasks = Math.max(maxActiveTasks, activeTasks);
+    await firstGate; activeTasks -= 1; return "first";
+  });
+  const failedTask = queue.run(async () => {
+    activeTasks += 1; maxActiveTasks = Math.max(maxActiveTasks, activeTasks);
+    activeTasks -= 1; throw new Error("expected");
+  });
+  let thirdRan = false;
+  const thirdTask = queue.run(async () => {
+    activeTasks += 1; maxActiveTasks = Math.max(maxActiveTasks, activeTasks);
+    thirdRan = true; activeTasks -= 1; return "third";
+  });
+  await Promise.resolve();
+  assert.equal(maxActiveTasks, 1);
+  assert.equal(thirdRan, false);
+  releaseFirst();
+  assert.equal(await firstTask, "first");
+  await assert.rejects(failedTask, /expected/);
+  assert.equal(await thirdTask, "third");
+  assert.equal(maxActiveTasks, 1);
+
+  const domA = {};
+  const domB = {};
+  const runtimeEntries = [
+    { selfEl: domA, heading: { heading: "Repeat", level: 2, position: { start: { line: 1, offset: 10 } } } },
+    { coverEl: domB, heading: { heading: "Repeat", level: 2, position: { start: { line: 5, offset: 40 } } } },
+  ];
+  const metadataHeadings = [
+    { heading: "Repeat", level: 2, position: { start: { line: 1, offset: 10 } } },
+    { heading: "Repeat", level: 2, position: { start: { line: 5, offset: 40 } } },
+  ];
+  assert.deepEqual(resolveOutlineHeadingIdentity(runtimeEntries, metadataHeadings, domB), {
+    heading: "Repeat", level: 2, startLine: 5, startOffset: 40, ordinal: 1,
+  });
+  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, metadataHeadings, {},), null);
+  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [metadataHeadings[1], metadataHeadings[1]], domB), null);
+  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [], domB), null);
 
   assert.deepEqual(
     getSectionExportPaths("notes/source.md", { heading: '  Bad<>:"/\\|?*\u0001 title...  ', ordinal: 0 }, false),
