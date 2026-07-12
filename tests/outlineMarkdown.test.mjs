@@ -67,10 +67,10 @@ try {
     parseMarkdownHeadings,
     sliceMarkdownSection,
   } = await import(pathToFileURL(bundlePath).href);
-  const { resolveOutlineHeadingIdentity } = await import(pathToFileURL(resolverBundlePath).href);
+  const { resolveOutlineHeadingIdentity, resolveOutlineHeadingIdentityWithOptionalMetadata } = await import(pathToFileURL(resolverBundlePath).href);
   const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
-  const { addPdfBookmarks, finalizeBookmarkedPdf } = await import(pathToFileURL(pdfBundlePath).href);
+  const { addPdfBookmarks, finalizeBookmarkedPdf, getPdfPrintAnchorDescriptor } = await import(pathToFileURL(pdfBundlePath).href);
 
   assert.equal(
     buildOutlineMarkdown(
@@ -613,6 +613,31 @@ try {
     heading: "Same", level: 2, startOffset: 0, startLine: 0, ordinal: 1,
   }), null);
 
+  const repeatedLf = parseMarkdownHeadingRanges("intro changed\n## Same\none\ntext\n## Same\ntwo");
+  assert.equal(locateMarkdownSection(repeatedLf, {
+    heading: "Same", level: 2, startOffset: 20, ordinal: 3,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), repeatedLf[1]);
+  const repeatedCrlf = parseMarkdownHeadingRanges("ordinary\r\n## Same\r\none\r\n## Same\r\ntwo");
+  assert.equal(locateMarkdownSection(repeatedCrlf, {
+    heading: "Same", level: 2, startOffset: 999,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), repeatedCrlf[1]);
+  const differentHeadingInserted = parseMarkdownHeadingRanges("## Other\nx\n## Same\none\n## Same\ntwo");
+  assert.equal(locateMarkdownSection(differentHeadingInserted, {
+    heading: "Same", level: 2, startOffset: 999,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), differentHeadingInserted[2]);
+  assert.equal(locateMarkdownSection(parseMarkdownHeadingRanges("## Same\none"), {
+    heading: "Same", level: 2, startOffset: 999, sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), null);
+  assert.equal(locateMarkdownSection(parseMarkdownHeadingRanges("## Same\none\n## Same\ntwo\n## Same\nthree"), {
+    heading: "Same", level: 2, startOffset: 999, sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), null);
+  assert.equal(locateMarkdownSection(parseMarkdownHeadingRanges("### Same\none\n### Same\ntwo"), {
+    heading: "Same", level: 2, startOffset: 999, sameHeadingIndex: 1, sameHeadingCount: 2,
+  }), null);
+
   const ambiguousHeadings = parseMarkdownHeadingRanges("## Same\na\nb\nc\n## Same");
   assert.equal(
     locateMarkdownSection(ambiguousHeadings, { heading: "Same", level: 2, startLine: 2 }),
@@ -686,10 +711,27 @@ try {
   ];
   assert.deepEqual(resolveOutlineHeadingIdentity(runtimeEntries, metadataHeadings, domB), {
     heading: "Repeat", level: 2, startLine: 5, startOffset: 40, ordinal: 1,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  });
+  assert.deepEqual(resolveOutlineHeadingIdentity(runtimeEntries, [
+    { heading: "Repeat", level: 2, position: { start: { line: 50, offset: 400 } } },
+  ], domB), {
+    heading: "Repeat", level: 2, startLine: 5, startOffset: 40, ordinal: 1,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  });
+  assert.deepEqual(resolveOutlineHeadingIdentity(runtimeEntries, metadataHeadings, {}, { heading: "Repeat", level: 2 }), null);
+  const uniqueMetadata = [{ heading: "Unique", level: 3, position: { start: { line: 7, offset: 70 } } }];
+  assert.deepEqual(resolveOutlineHeadingIdentity([], uniqueMetadata, {}, { heading: "Unique", level: 3 }), {
+    heading: "Unique", level: 3, startLine: 7, startOffset: 70, ordinal: 0,
+    sameHeadingIndex: 0, sameHeadingCount: 1,
   });
   assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, metadataHeadings, {},), null);
-  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [metadataHeadings[1], metadataHeadings[1]], domB), null);
-  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [], domB), null);
+  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [metadataHeadings[1], metadataHeadings[1]], domB)?.ordinal, 1);
+  assert.equal(resolveOutlineHeadingIdentity(runtimeEntries, [], domB)?.ordinal, 1);
+  assert.deepEqual(resolveOutlineHeadingIdentityWithOptionalMetadata(runtimeEntries, undefined, domB), {
+    heading: "Repeat", level: 2, startLine: 5, startOffset: 40, ordinal: 1,
+    sameHeadingIndex: 1, sameHeadingCount: 2,
+  });
 
   assert.deepEqual(
     getSectionExportPaths("notes/source.md", { heading: '  Bad<>:"/\\|?*\u0001 title...  ', ordinal: 0 }, false),
@@ -717,6 +759,14 @@ try {
   assert.equal(Array.from(longPaths.markdownPath.slice("source--".length, -".section.md".length)).length, 80);
   assert.equal(longPaths.markdownPath.endsWith("\u{1F600}\u7ed3.section.md"), true);
 
+  assert.deepEqual(getPdfPrintAnchorDescriptor("目录", 1, 0, { syntheticRootHeading: true }), {
+    heading: "目录", level: 0,
+  });
+  assert.deepEqual(getPdfPrintAnchorDescriptor("Selected H1", 1, 1, { syntheticRootHeading: true }), {
+    heading: "Selected H1", level: 1,
+  });
+  assert.equal(getPdfPrintAnchorDescriptor("目录", 1, 0, {}), null);
+
   const sourcePdf = await PDFDocument.create();
   sourcePdf.addPage();
   sourcePdf.addPage();
@@ -731,6 +781,18 @@ try {
   assert.match(bookmarkedPdfText, /Section|00530065006300740069006F006E/);
   assert.equal(hasPdfOutlines(bookmarkedPdfBytes), true);
   assert.equal(hasPdfOutlines(sourcePdfBytes), false);
+
+  const levelZeroPdf = await PDFDocument.create();
+  levelZeroPdf.addPage();
+  levelZeroPdf.addPage();
+  const levelZeroBytes = await addPdfBookmarks(await levelZeroPdf.save({ useObjectStreams: false }), [
+    { heading: "Root", level: 0, pageIndex: 0 },
+    { heading: "Selected H1", level: 1, pageIndex: 1 },
+  ]);
+  assert.equal(hasPdfOutlines(levelZeroBytes), true);
+  const levelZeroText = Buffer.from(levelZeroBytes).toString("latin1");
+  assert.match(levelZeroText, /Root|0052006F006F0074/);
+  assert.match(levelZeroText, /Selected H1|00530065006C00650063007400650064002000480031/);
 
   const anchorPdf = await PDFDocument.create();
   const anchorPage0 = anchorPdf.addPage();

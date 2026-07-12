@@ -16,6 +16,8 @@ export interface MarkdownHeadingSelection extends OutlineHeading {
   startLine?: number;
   startOffset?: number;
   ordinal?: number;
+  sameHeadingIndex?: number;
+  sameHeadingCount?: number;
 }
 
 export interface SectionExportPaths {
@@ -316,19 +318,32 @@ export function locateMarkdownSection(
 ): MarkdownHeadingRange | null {
   const identityMatches = headings.filter((heading) =>
     heading.level === selection.level && heading.heading === selection.heading);
+  const hasLiveOccurrence = Number.isInteger(selection.sameHeadingIndex) &&
+    Number.isInteger(selection.sameHeadingCount);
+
+  if (hasLiveOccurrence) {
+    const index = selection.sameHeadingIndex as number;
+    const count = selection.sameHeadingCount as number;
+    if (count < 1 || index < 0 || index >= count || identityMatches.length !== count) return null;
+    const occurrence = identityMatches[index];
+    if (!occurrence) return null;
+    if (Number.isFinite(selection.startOffset)) {
+      const exactMatches = identityMatches.filter((heading) => heading.startOffset === selection.startOffset);
+      if (exactMatches.length > 1) return null;
+      if (exactMatches.length === 1 && exactMatches[0] !== occurrence) return null;
+    }
+    return occurrence;
+  }
 
   if (Number.isFinite(selection.startOffset)) {
     const exactMatches = identityMatches.filter((heading) => heading.startOffset === selection.startOffset);
     if (exactMatches.length === 1) {
-      if (Number.isFinite(selection.ordinal) && exactMatches[0].ordinal !== selection.ordinal) {
-        return null;
-      }
+      if (Number.isFinite(selection.ordinal) && exactMatches[0].ordinal !== selection.ordinal) return null;
       return exactMatches[0];
     }
     if (exactMatches.length > 1) return null;
   }
 
-  // A stale ordinal must never choose among duplicate headings after edits.
   if (identityMatches.length !== 1 || !Number.isFinite(selection.startLine)) return null;
   return Math.abs(identityMatches[0].startLine - (selection.startLine as number)) <= 2
     ? identityMatches[0]

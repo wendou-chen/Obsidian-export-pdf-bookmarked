@@ -24,7 +24,6 @@ import {
   locateMarkdownSection,
   parseMarkdownHeadingRanges,
   sliceMarkdownSection,
-  isPdfTocHeadingTitle,
   mapPdfBookmarkHeadingsToPages,
   needsSyntheticPdfRootHeading,
   needsSectionOrdinalSuffix,
@@ -37,7 +36,9 @@ import {
   addPdfBookmarks,
   finalizeBookmarkedPdf,
   PDF_PRINT_ANCHOR_URI_PREFIX,
+  getPdfPrintAnchorDescriptor,
   type PdfAnchorTarget,
+  type PdfPrintAnchorOptions,
 } from "./pdfOutline";
 import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
 import { SerialTaskQueue } from "./serialTaskQueue";
@@ -246,7 +247,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       const resolved = await this.resolveSelectedSection(selection);
       if (!resolved) return;
       const printable = getPrintableSectionPdfMarkdown(resolved.section, selection.file.basename);
-      const printed = await this.printMarkdownToPdf(selection.file, printable);
+      const printed = await this.printMarkdownToPdf(selection.file, printable, { syntheticRootHeading: true });
       const finalized = await finalizeBookmarkedPdf(printed.pdfBytes, printed.anchors);
       const path = normalizePath(getSectionExportPaths(
         selection.file.path, resolved.selected, resolved.appendOrdinal,
@@ -381,7 +382,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         new Notice(`已导出带书签 PDF（${finalized.matchedCount} 个书签）：${outputPath}`);
       } else {
         new Notice(
-          `已导出 PDF，但未能定位标题锚点。可改用「为原生导出的 PDF 添加书签」：${outputPath}`,
+          `已导出 PDF，但未能定位标题锚点。可改用「给已有 PDF 注入书签」：${outputPath}`,
         );
       }
     } catch (error) {
@@ -394,13 +395,15 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   private printMarkdownToPdf(
     file: TFile,
     markdown: string,
+    options: PdfPrintAnchorOptions = {},
   ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
-    return this.pdfPrintQueue.run(() => this.printMarkdownToPdfSerial(file, markdown));
+    return this.pdfPrintQueue.run(() => this.printMarkdownToPdfSerial(file, markdown, options));
   }
 
   private async printMarkdownToPdfSerial(
     file: TFile,
     markdown: string,
+    options: PdfPrintAnchorOptions,
   ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
     const webContents = this.getCurrentWebContents();
     if (!webContents) {
@@ -414,7 +417,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
 
     try {
       await MarkdownRenderer.render(this.app, markdown, content, file.path, component);
-      const anchors = this.injectHeadingPrintAnchors(content);
+      const anchors = this.injectHeadingPrintAnchors(content, options);
       await this.waitForRenderToSettle(content);
 
       const pdfData = await webContents.printToPDF(PDF_PRINT_OPTIONS);
@@ -432,14 +435,18 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   // 因此锚点用 position:absolute; width:1px; height:1px; right:0 实现视觉隐藏，
   // 保证 Chromium 将其视为"已渲染的可交互元素"并写入 Link annotation。
   // 参考：obsidian-better-export-pdf 的 CSS_PATCH / styles.css。
-  private injectHeadingPrintAnchors(container: HTMLElement): PdfAnchorTarget[] {
+  private injectHeadingPrintAnchors(
+    container: HTMLElement,
+    options: PdfPrintAnchorOptions = {},
+  ): PdfAnchorTarget[] {
     const anchors: PdfAnchorTarget[] = [];
+    const headings = Array.from(container.querySelectorAll<HTMLElement>("h1, h2, h3"));
 
-    for (const heading of Array.from(container.querySelectorAll<HTMLElement>("h1, h2, h3"))) {
-      const title = (heading.textContent ?? "").trim();
-      if (!title || isPdfTocHeadingTitle(title)) {
-        continue;
-      }
+    headings.forEach((heading, headingIndex) => {
+      const descriptor = getPdfPrintAnchorDescriptor(
+        heading.textContent ?? "", Number(heading.tagName.slice(1)), headingIndex, options,
+      );
+      if (!descriptor) return;
 
       const key = `omx-${anchors.length}`;
       const anchor = document.createElement("a");
@@ -447,13 +454,8 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       anchor.className = PRINT_ANCHOR_CLASS;
       heading.style.position = "relative";
       heading.prepend(anchor);
-
-      anchors.push({
-        key,
-        heading: title,
-        level: Number(heading.tagName.slice(1)),
-      });
-    }
+      anchors.push({ key, ...descriptor });
+    });
 
     return anchors;
   }

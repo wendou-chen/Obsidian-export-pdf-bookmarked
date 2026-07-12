@@ -2,7 +2,7 @@
 import type { HeadingCache } from "obsidian";
 
 import type { MarkdownHeadingSelection } from "./outlineMarkdown";
-import { resolveOutlineHeadingIdentity } from "./outlineContextResolver";
+import { resolveOutlineHeadingIdentityWithOptionalMetadata } from "./outlineContextResolver";
 
 export interface OutlineHeadingSelection extends MarkdownHeadingSelection {
   file: TFile;
@@ -11,6 +11,8 @@ export interface OutlineHeadingSelection extends MarkdownHeadingSelection {
   startLine: number;
   startOffset: number;
   ordinal: number;
+  sameHeadingIndex: number;
+  sameHeadingCount: number;
 }
 
 export interface OutlineSectionActions {
@@ -38,11 +40,14 @@ function resolveOutlineSelection(
 ): OutlineHeadingSelection | null {
   const view = leaf.view as typeof leaf.view & OutlineViewPrivate;
   const file = view.file;
-  const entries = view.cachedHeadingDom;
-  if (!(file instanceof TFile) || !Array.isArray(entries)) return null;
-  const metadataHeadings = plugin.app.metadataCache.getFileCache(file)?.headings;
-  if (!metadataHeadings) return null;
-  const resolved = resolveOutlineHeadingIdentity(entries, metadataHeadings, itemEl);
+  const entries = Array.isArray(view.cachedHeadingDom) ? view.cachedHeadingDom : [];
+  if (!(file instanceof TFile)) return null;
+  const metadataHeadings = plugin.app.metadataCache.getFileCache(file)?.headings ?? [];
+  const displayHeading = itemEl.textContent?.trim();
+  const resolved = resolveOutlineHeadingIdentityWithOptionalMetadata(
+    entries, metadataHeadings, itemEl,
+    displayHeading ? { heading: displayHeading } : undefined,
+  );
   return resolved ? { file, ...resolved } : null;
 }
 

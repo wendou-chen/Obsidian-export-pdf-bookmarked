@@ -11,7 +11,7 @@ import {
   PDFString,
 } from "pdf-lib";
 
-import type { PdfBookmarkTarget } from "./outlineMarkdown";
+import { isPdfTocHeadingTitle, type PdfBookmarkTarget } from "./outlineMarkdown";
 
 export const PDF_PRINT_ANCHOR_URI_PREFIX = "af://";
 
@@ -19,6 +19,23 @@ export interface PdfAnchorTarget {
   key: string;
   heading: string;
   level: number;
+}
+
+export interface PdfPrintAnchorOptions {
+  syntheticRootHeading?: boolean;
+}
+
+export function getPdfPrintAnchorDescriptor(
+  title: string,
+  headingLevel: number,
+  headingIndex: number,
+  options: PdfPrintAnchorOptions = {},
+): Pick<PdfAnchorTarget, "heading" | "level"> | null {
+  const heading = title.trim();
+  if (!heading) return null;
+  const isSyntheticRoot = options.syntheticRootHeading === true && headingIndex === 0 && headingLevel === 1;
+  if (!isSyntheticRoot && isPdfTocHeadingTitle(heading)) return null;
+  return { heading, level: isSyntheticRoot ? 0 : headingLevel };
 }
 
 export interface FinalizeBookmarkedPdfResult {
