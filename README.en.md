@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | English
 
-Export Obsidian notes to PDFs with native bookmarks generated from Markdown headings.
+Export complete Obsidian notes or selected sections from the core Outline pane to PDFs with native bookmarks generated from Markdown headings.
 
 This plugin turns a note's heading structure into a real PDF outline tree, so PDF readers can show the document outline/bookmarks panel immediately after export. It also keeps the original outline workflow: you can copy or export a note outline as Markdown.
 
@@ -10,7 +10,7 @@ This plugin turns a note's heading structure into a real PDF outline tree, so PD
 
 This plugin was built for two main workflows:
 
-- Organizing postgraduate entrance exam syllabi and study materials. Long Markdown notes can be exported as book-like PDFs whose headings become clickable PDF bookmarks, which makes review documents easier to navigate.
+- Organizing postgraduate entrance exam syllabi and study materials. Long Markdown notes can be exported as book-like PDFs whose headings become clickable PDF bookmarks, which makes review documents easier to navigate. You can also copy or export only the section you need from the right-side Outline pane.
 - Working together with my note repository, [MBA Study Notes](https://github.com/wendou-chen/MBA-Study-Notes). The notes live and evolve in Obsidian, while this plugin turns selected notes, outlines, and study packs into shareable bookmarked PDFs.
 
 Used together, the note repository provides the structured knowledge base, and this plugin provides a clean export path from Markdown structure to readable PDF documents.
@@ -22,6 +22,34 @@ Used together, the note repository provides the structured knowledge base, and t
 - Generate bookmarks from Markdown headings.
 - Open exported PDFs with `/Outlines` and `/PageMode /UseOutlines`.
 - Copy or export the current note outline as Markdown.
+- Precisely copy or export the complete Markdown section for a heading in Obsidian's core right-side Outline pane.
+- Export a selected section as a bookmarked PDF on desktop.
+
+## Export a Section From the Right-Side Outline
+
+Right-click a heading in Obsidian's core right-side **Outline** pane to use:
+
+1. **复制此节 Markdown** (Copy this section as Markdown)
+2. **导出此节 Markdown** (Export this section as Markdown)
+3. **导出此节带书签 PDF** (Export this section as a bookmarked PDF; desktop only)
+
+The section starts at the selected heading and includes the heading itself, its body, and all descendant headings. It ends immediately before the next heading at the same or a higher level. If no such heading follows, the section continues to the end of the file. The original Markdown is preserved without renumbering or demoting headings.
+
+Exports are written beside the source note:
+
+- Markdown: `source-file--heading.section.md`
+- PDF: `source-file--heading.bookmarked.pdf`
+
+Invalid filename characters and excess whitespace are sanitized. If duplicate headings, or headings that sanitize to the same filename, would collide, the filename receives that heading's 1-based ordinal in the full document before the extension. Exporting the same section again overwrites its corresponding output.
+
+A section PDF adds the source note's basename as a synthetic H1, which becomes both the visual top-level title and the root PDF bookmark. The selected heading and its descendants retain their original Markdown levels. The existing bookmark rules add PDF bookmarks for H1–H3 headings within the section.
+
+### Live Content and Safe Failure
+
+- If the source file is active or open in any Markdown editor, copy and export read the editor's latest snapshot, including unsaved changes. Otherwise, the plugin reads the Vault file.
+- Duplicate headings are resolved by position and full-document ordinal, never by blindly choosing the first matching title.
+- If the heading is changed or deleted after the context menu opens, the action stops safely and asks you to right-click again.
+- Obsidian does not expose a public context-menu API for core Outline headings. The plugin isolates private Outline details in a validated adapter. If a future Obsidian release changes that structure, the section menu stays hidden or the action aborts rather than guessing and exporting the wrong section.
 
 ## Commands
 
@@ -30,15 +58,15 @@ Used together, the note repository provides the structured knowledge base, and t
 | Copy current file outline as Markdown | Copies the note heading tree to the clipboard. |
 | Export current file outline as Markdown | Writes a `*.outline.md` file beside the source note. |
 | Export bookmarked PDF | Prints the current note to `*.bookmarked.pdf` and injects native PDF bookmarks. |
-| Add bookmarks to native PDF | Finds a matching PDF and adds bookmarks based on the source Markdown headings. |
+| Add bookmarks to existing PDF | Finds a matching PDF and adds bookmarks based on the source Markdown headings. |
 
-PDF commands are available in the Obsidian desktop app because they depend on Electron PDF export APIs.
+PDF commands depend on Electron PDF export APIs and therefore require the Obsidian desktop app. Copying or exporting a section as Markdown remains available on mobile.
 
 ## Why This Exists
 
 Obsidian can export notes to PDF, and several community plugins can improve export styling or long-form publishing. The missing piece for study notes, manuals, and book-like documents is reliable native PDF bookmarks generated from the Markdown heading structure.
 
-This plugin focuses on that narrow job: keep writing in Markdown, export to PDF, and preserve the outline as clickable PDF bookmarks.
+This plugin focuses on that narrow job: keep writing in Markdown, export a complete note or a section selected from the right-side Outline, and preserve the heading structure as clickable PDF bookmarks.
 
 ## Plugin Positioning
 
@@ -73,20 +101,21 @@ npm run dev
 npm test
 ```
 
-The test suite checks outline parsing, export paths, heading filtering, page mapping, and PDF outline injection.
+The test suite checks outline and section parsing, export paths, duplicate-heading resolution, heading filtering, page mapping, and PDF outline injection.
 
 ## Limitations
 
-- PDF export commands require Obsidian desktop.
+- PDF export commands and bookmarked section PDF export require Obsidian desktop.
 - Bookmarks are generated from Markdown headings.
 - Adding bookmarks to an already exported PDF depends on matching heading text to PDF page text, so scanned/image-only PDFs may not map well.
 - The default PDF bookmark filter targets the top heading levels to keep exported outlines readable.
+- Section context menus depend on a runtime-validated private structure in Obsidian's core Outline view. If it becomes incompatible, the feature fails closed instead of guessing a heading.
 
 ## GitHub Repository Metadata
 
 Suggested GitHub description:
 
-> Export Obsidian notes to PDFs with native bookmarks generated from Markdown headings.
+> Export Obsidian notes or Outline sections to PDFs with native bookmarks generated from Markdown headings.
 
 Suggested topics:
 
