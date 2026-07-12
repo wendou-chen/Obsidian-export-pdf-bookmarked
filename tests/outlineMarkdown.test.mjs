@@ -36,10 +36,14 @@ try {
     getOutlineExportPath,
     getPdfBookmarkHeadings,
     getPrintableBookmarkedPdfMarkdown,
+    getSectionExportPaths,
     hasPdfOutlines,
+    locateMarkdownSection,
     mapPdfBookmarkHeadingsToPages,
     needsSyntheticPdfRootHeading,
+    parseMarkdownHeadingRanges,
     parseMarkdownHeadings,
+    sliceMarkdownSection,
   } = await import(pathToFileURL(bundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const { addPdfBookmarks, finalizeBookmarkedPdf } = await import(pathToFileURL(pdfBundlePath).href);
@@ -191,6 +195,211 @@ try {
     parseMarkdownHeadings(["```", "### Fake heading", "```", "## Real heading"].join("\n")),
     [{ heading: "Real heading", level: 2 }],
   );
+
+  const sectionMarkdown = [
+    "# Root",
+    "intro",
+    "## Repeat",
+    "first body",
+    "### Child",
+    "child body",
+    "## Repeat",
+    "second body",
+    "# Next",
+    "tail",
+  ].join("\n");
+  const sectionHeadings = parseMarkdownHeadingRanges(sectionMarkdown);
+  assert.deepEqual(
+    sectionHeadings.map(({ heading, level, style, startLine, endLine, ordinal }) => ({
+      heading,
+      level,
+      style,
+      startLine,
+      endLine,
+      ordinal,
+    })),
+    [
+      { heading: "Root", level: 1, style: "atx", startLine: 0, endLine: 0, ordinal: 0 },
+      { heading: "Repeat", level: 2, style: "atx", startLine: 2, endLine: 2, ordinal: 1 },
+      { heading: "Child", level: 3, style: "atx", startLine: 4, endLine: 4, ordinal: 2 },
+      { heading: "Repeat", level: 2, style: "atx", startLine: 6, endLine: 6, ordinal: 3 },
+      { heading: "Next", level: 1, style: "atx", startLine: 8, endLine: 8, ordinal: 4 },
+    ],
+  );
+  assert.equal(sectionHeadings[1].startOffset, sectionMarkdown.indexOf("## Repeat"));
+  assert.equal(
+    sectionHeadings[1].endOffset,
+    sectionMarkdown.indexOf("## Repeat") + "## Repeat".length,
+  );
+
+  assert.equal(
+    sliceMarkdownSection(sectionMarkdown, sectionHeadings, sectionHeadings[0]),
+    sectionMarkdown.slice(0, sectionMarkdown.indexOf("# Next")),
+  );
+  assert.equal(
+    sliceMarkdownSection(sectionMarkdown, sectionHeadings, sectionHeadings[1]),
+    sectionMarkdown.slice(
+      sectionMarkdown.indexOf("## Repeat"),
+      sectionMarkdown.indexOf("## Repeat", sectionMarkdown.indexOf("## Repeat") + 1),
+    ),
+  );
+  assert.equal(
+    sliceMarkdownSection(sectionMarkdown, sectionHeadings, sectionHeadings[3]),
+    sectionMarkdown.slice(sectionHeadings[3].startOffset, sectionHeadings[4].startOffset),
+  );
+  assert.equal(
+    sliceMarkdownSection(sectionMarkdown, sectionHeadings, sectionHeadings[4]),
+    "# Next\ntail",
+  );
+
+  const emptySectionMarkdown = "## Empty\n## Following\nbody";
+  const emptySectionHeadings = parseMarkdownHeadingRanges(emptySectionMarkdown);
+  assert.equal(
+    sliceMarkdownSection(emptySectionMarkdown, emptySectionHeadings, emptySectionHeadings[0]),
+    "## Empty\n",
+  );
+
+  const atxHeadings = parseMarkdownHeadingRanges([
+    "   ### Three spaces ###   ",
+    "## Closing ##",
+    "######",
+    "    # Indented code, not a heading",
+    "####### Not a heading",
+    "#NoSpace",
+  ].join("\n"));
+  assert.deepEqual(
+    atxHeadings.map(({ heading, level, style }) => ({ heading, level, style })),
+    [
+      { heading: "Three spaces", level: 3, style: "atx" },
+      { heading: "Closing", level: 2, style: "atx" },
+      { heading: "", level: 6, style: "atx" },
+    ],
+  );
+
+  const setextMarkdown = "Setext one\n===========\n\nSetext two\n---\nbody";
+  const setextHeadings = parseMarkdownHeadingRanges(setextMarkdown);
+  assert.deepEqual(
+    setextHeadings.map(({ heading, level, style, startLine, endLine }) => ({
+      heading,
+      level,
+      style,
+      startLine,
+      endLine,
+    })),
+    [
+      { heading: "Setext one", level: 1, style: "setext", startLine: 0, endLine: 1 },
+      { heading: "Setext two", level: 2, style: "setext", startLine: 3, endLine: 4 },
+    ],
+  );
+  assert.equal(setextHeadings[0].startOffset, 0);
+  assert.equal(setextHeadings[0].endOffset, "Setext one\n===========".length);
+
+  const protectedMarkdown = [
+    "---",
+    "title: '# YAML heading'",
+    "fake",
+    "---",
+    "# Real root",
+    "````js",
+    "## Fake in backtick fence",
+    "```",
+    "### Still fake after short close",
+    "~~~~",
+    "#### Still fake after other marker",
+    "`````",
+    "## After backtick fence",
+    "~~~",
+    "# Fake in tilde fence",
+    "~~~~",
+    "### After tilde fence",
+  ].join("\n");
+  assert.deepEqual(parseMarkdownHeadings(protectedMarkdown), [
+    { heading: "Real root", level: 1 },
+    { heading: "After backtick fence", level: 2 },
+    { heading: "After tilde fence", level: 3 },
+  ]);
+
+  const crlfMarkdown = "# First\r\nbody\r\nSecond\r\n------\r\n## Third";
+  const crlfHeadings = parseMarkdownHeadingRanges(crlfMarkdown);
+  assert.deepEqual(
+    crlfHeadings.map(({ heading, startLine, endLine, startOffset, endOffset }) => ({
+      heading,
+      startLine,
+      endLine,
+      startOffset,
+      endOffset,
+    })),
+    [
+      { heading: "First", startLine: 0, endLine: 0, startOffset: 0, endOffset: 7 },
+      {
+        heading: "Second",
+        startLine: 2,
+        endLine: 3,
+        startOffset: crlfMarkdown.indexOf("Second"),
+        endOffset: crlfMarkdown.indexOf("------") + "------".length,
+      },
+      {
+        heading: "Third",
+        startLine: 4,
+        endLine: 4,
+        startOffset: crlfMarkdown.indexOf("## Third"),
+        endOffset: crlfMarkdown.length,
+      },
+    ],
+  );
+
+  assert.equal(
+    locateMarkdownSection(sectionHeadings, {
+      heading: "Repeat",
+      level: 2,
+      startOffset: sectionHeadings[3].startOffset,
+    }),
+    sectionHeadings[3],
+  );
+  assert.equal(
+    locateMarkdownSection(sectionHeadings, { heading: "Repeat", level: 2, ordinal: 1 }),
+    sectionHeadings[1],
+  );
+  assert.equal(
+    locateMarkdownSection(sectionHeadings, { heading: "Child", level: 3, startLine: 5 }),
+    sectionHeadings[2],
+  );
+  assert.equal(
+    locateMarkdownSection(sectionHeadings, { heading: "Missing", level: 2, startLine: 2 }),
+    null,
+  );
+
+  const ambiguousHeadings = parseMarkdownHeadingRanges("## Same\na\nb\nc\n## Same");
+  assert.equal(
+    locateMarkdownSection(ambiguousHeadings, { heading: "Same", level: 2, startLine: 2 }),
+    null,
+  );
+
+  assert.deepEqual(
+    getSectionExportPaths("notes/source.md", { heading: '  Bad<>:"/\\|?*\u0001 title...  ', ordinal: 0 }, false),
+    {
+      markdownPath: "notes/source--Bad title.section.md",
+      pdfPath: "notes/source--Bad title.bookmarked.pdf",
+    },
+  );
+  assert.deepEqual(
+    getSectionExportPaths("notes/source.md", { heading: "Repeat", ordinal: 1 }, true),
+    {
+      markdownPath: "notes/source--Repeat-2.section.md",
+      pdfPath: "notes/source--Repeat-2.bookmarked.pdf",
+    },
+  );
+  assert.deepEqual(
+    getSectionExportPaths("source.md", { heading: "<>... ", ordinal: 0 }, false),
+    {
+      markdownPath: "source--\u672a\u547d\u540d\u6807\u9898.section.md",
+      pdfPath: "source--\u672a\u547d\u540d\u6807\u9898.bookmarked.pdf",
+    },
+  );
+  const longHeading = `${"\u{1F600}".repeat(79)}\u7ed3\u5c3e`;
+  const longPaths = getSectionExportPaths("source.md", { heading: longHeading, ordinal: 0 }, false);
+  assert.equal(Array.from(longPaths.markdownPath.slice("source--".length, -".section.md".length)).length, 80);
+  assert.equal(longPaths.markdownPath.endsWith("\u{1F600}\u7ed3.section.md"), true);
 
   const sourcePdf = await PDFDocument.create();
   sourcePdf.addPage();

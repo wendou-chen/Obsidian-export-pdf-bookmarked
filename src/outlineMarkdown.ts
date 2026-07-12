@@ -3,6 +3,26 @@ export interface OutlineHeading {
   level: number;
 }
 
+export interface MarkdownHeadingRange extends OutlineHeading {
+  style: "atx" | "setext";
+  startLine: number;
+  endLine: number;
+  startOffset: number;
+  endOffset: number;
+  ordinal: number;
+}
+
+export interface MarkdownHeadingSelection extends OutlineHeading {
+  startLine?: number;
+  startOffset?: number;
+  ordinal?: number;
+}
+
+export interface SectionExportPaths {
+  markdownPath: string;
+  pdfPath: string;
+}
+
 export interface PdfBookmarkTarget extends OutlineHeading {
   pageIndex: number;
   top?: number;
@@ -154,41 +174,206 @@ export function mapPdfBookmarkHeadingsToPages(
   return targets;
 }
 
-export function parseMarkdownHeadings(markdown: string): OutlineHeading[] {
-  const headings: OutlineHeading[] = [];
-  let inFence = false;
-  let fenceMarker = "";
+interface MarkdownLine {
+  text: string;
+  lineNumber: number;
+  startOffset: number;
+  endOffset: number;
+}
 
-  for (const line of markdown.split(/\r?\n/)) {
-    const fenceMatch = line.match(/^\s*(```+|~~~+)/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1][0];
-      if (!inFence) {
-        inFence = true;
-        fenceMarker = marker;
-      } else if (marker === fenceMarker) {
-        inFence = false;
-        fenceMarker = "";
+interface SetextCandidate {
+  line: MarkdownLine;
+  heading: string;
+}
+
+export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRange[] {
+  const headings: MarkdownHeadingRange[] = [];
+  const lines = splitMarkdownLines(markdown);
+  const frontmatterEndOffset = getFrontmatterEndIndex(markdown);
+  let fenceCharacter: "`" | "~" | null = null;
+  let fenceLength = 0;
+  let setextCandidate: SetextCandidate | null = null;
+
+  const addHeading = (heading: Omit<MarkdownHeadingRange, "ordinal">): void => {
+    headings.push({ ...heading, ordinal: headings.length });
+  };
+
+  for (const line of lines) {
+    if (frontmatterEndOffset !== null && line.startOffset < frontmatterEndOffset) {
+      setextCandidate = null;
+      continue;
+    }
+
+    if (fenceCharacter !== null) {
+      const closingFence = line.text.match(/^ {0,3}(`+|~+)[ \t]*$/);
+      if (
+        closingFence
+        && closingFence[1][0] === fenceCharacter
+        && closingFence[1].length >= fenceLength
+      ) {
+        fenceCharacter = null;
+        fenceLength = 0;
       }
+      setextCandidate = null;
       continue;
     }
 
-    if (inFence) {
+    const openingFence = line.text.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (openingFence) {
+      fenceCharacter = openingFence[1][0] as "`" | "~";
+      fenceLength = openingFence[1].length;
+      setextCandidate = null;
       continue;
     }
 
-    const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
-    if (!headingMatch) {
+    const setextUnderline = line.text.match(/^ {0,3}(=+|-+)[ \t]*$/);
+    if (setextUnderline && setextCandidate !== null) {
+      addHeading({
+        heading: setextCandidate.heading,
+        level: setextUnderline[1][0] === "=" ? 1 : 2,
+        style: "setext",
+        startLine: setextCandidate.line.lineNumber,
+        endLine: line.lineNumber,
+        startOffset: setextCandidate.line.startOffset,
+        endOffset: line.endOffset,
+      });
+      setextCandidate = null;
       continue;
     }
 
-    headings.push({
-      heading: headingMatch[2].trim(),
-      level: headingMatch[1].length,
-    });
+    const atxHeading = line.text.match(/^ {0,3}(#{1,6})(?:[ \t]+(.*)|[ \t]*)$/);
+    if (atxHeading) {
+      const rawHeading = atxHeading[2] ?? "";
+      const headingWithoutClosingHashes = rawHeading.replace(/[ \t]+#+[ \t]*$/, "");
+      addHeading({
+        heading: headingWithoutClosingHashes.trim(),
+        level: atxHeading[1].length,
+        style: "atx",
+        startLine: line.lineNumber,
+        endLine: line.lineNumber,
+        startOffset: line.startOffset,
+        endOffset: line.endOffset,
+      });
+      setextCandidate = null;
+      continue;
+    }
+
+    const candidateHeading = line.text.trim();
+    setextCandidate = candidateHeading.length > 0
+      ? { line, heading: candidateHeading }
+      : null;
   }
 
   return headings;
+}
+
+export function parseMarkdownHeadings(markdown: string): OutlineHeading[] {
+  return parseMarkdownHeadingRanges(markdown).map(({ heading, level }) => ({ heading, level }));
+}
+
+export function locateMarkdownSection(
+  headings: MarkdownHeadingRange[],
+  selection: MarkdownHeadingSelection,
+): MarkdownHeadingRange | null {
+  const matchesIdentity = (heading: MarkdownHeadingRange): boolean => (
+    heading.level === selection.level && heading.heading === selection.heading
+  );
+
+  if (Number.isFinite(selection.startOffset)) {
+    const matches = headings.filter((heading) => (
+      matchesIdentity(heading) && heading.startOffset === selection.startOffset
+    ));
+    if (matches.length > 0) {
+      return matches.length === 1 ? matches[0] : null;
+    }
+  }
+
+  if (Number.isFinite(selection.ordinal)) {
+    const matches = headings.filter((heading) => (
+      matchesIdentity(heading) && heading.ordinal === selection.ordinal
+    ));
+    if (matches.length > 0) {
+      return matches.length === 1 ? matches[0] : null;
+    }
+  }
+
+  if (Number.isFinite(selection.startLine)) {
+    const startLine = selection.startLine as number;
+    const matches = headings.filter((heading) => (
+      matchesIdentity(heading) && Math.abs(heading.startLine - startLine) <= 2
+    ));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  return null;
+}
+
+export function sliceMarkdownSection(
+  markdown: string,
+  headings: MarkdownHeadingRange[],
+  selected: MarkdownHeadingRange,
+): string {
+  const nextBoundary = headings.find((heading) => (
+    heading.startOffset > selected.startOffset && heading.level <= selected.level
+  ));
+  return markdown.slice(selected.startOffset, nextBoundary?.startOffset ?? markdown.length);
+}
+
+export function getSectionExportPaths(
+  filePath: string,
+  selection: Pick<MarkdownHeadingRange, "heading" | "ordinal">,
+  appendOrdinal: boolean,
+): SectionExportPaths {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const slashIndex = normalizedPath.lastIndexOf("/");
+  const folder = slashIndex >= 0 ? normalizedPath.slice(0, slashIndex + 1) : "";
+  const fileName = slashIndex >= 0 ? normalizedPath.slice(slashIndex + 1) : normalizedPath;
+  const basename = fileName.replace(/\.md$/i, "");
+  const safeHeading = sanitizeHeadingPathComponent(selection.heading);
+  const ordinalSuffix = appendOrdinal ? `-${selection.ordinal + 1}` : "";
+  const stem = `${folder}${basename}--${safeHeading}${ordinalSuffix}`;
+
+  return {
+    markdownPath: `${stem}.section.md`,
+    pdfPath: `${stem}.bookmarked.pdf`,
+  };
+}
+
+function splitMarkdownLines(markdown: string): MarkdownLine[] {
+  const lines: MarkdownLine[] = [];
+  let startOffset = 0;
+  let lineNumber = 0;
+
+  while (startOffset < markdown.length) {
+    const newlineOffset = markdown.indexOf("\n", startOffset);
+    const rawEndOffset = newlineOffset >= 0 ? newlineOffset : markdown.length;
+    const endOffset = rawEndOffset > startOffset && markdown[rawEndOffset - 1] === "\r"
+      ? rawEndOffset - 1
+      : rawEndOffset;
+    lines.push({
+      text: markdown.slice(startOffset, endOffset),
+      lineNumber,
+      startOffset,
+      endOffset,
+    });
+    if (newlineOffset < 0) {
+      break;
+    }
+    startOffset = newlineOffset + 1;
+    lineNumber += 1;
+  }
+
+  return lines;
+}
+
+function sanitizeHeadingPathComponent(heading: string): string {
+  const cleaned = heading
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/, "");
+  const truncated = Array.from(cleaned).slice(0, 80).join("").replace(/[. ]+$/, "");
+  return truncated || "\u672a\u547d\u540d\u6807\u9898";
 }
 
 function clampHeadingLevel(level: number): number {
