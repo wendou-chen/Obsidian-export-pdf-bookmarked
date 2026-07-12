@@ -182,9 +182,11 @@ interface MarkdownLine {
 }
 
 interface SetextCandidate {
-  line: MarkdownLine;
-  heading: string;
+  firstLine: MarkdownLine;
+  paragraphLines: string[];
 }
+
+type HtmlBlockEndPattern = RegExp | null;
 
 export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRange[] {
   const headings: MarkdownHeadingRange[] = [];
@@ -192,6 +194,7 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
   const frontmatterEndOffset = getFrontmatterEndIndex(markdown);
   let fenceCharacter: "`" | "~" | null = null;
   let fenceLength = 0;
+  let htmlBlockEndPattern: HtmlBlockEndPattern | undefined;
   let setextCandidate: SetextCandidate | null = null;
 
   const addHeading = (heading: Omit<MarkdownHeadingRange, "ordinal">): void => {
@@ -200,6 +203,16 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
 
   for (const line of lines) {
     if (frontmatterEndOffset !== null && line.startOffset < frontmatterEndOffset) {
+      setextCandidate = null;
+      continue;
+    }
+
+    if (htmlBlockEndPattern !== undefined) {
+      const endsAtBlankLine = htmlBlockEndPattern === null && line.text.trim().length === 0;
+      const hasClosingToken = htmlBlockEndPattern !== null && htmlBlockEndPattern.test(line.text);
+      if (endsAtBlankLine || hasClosingToken) {
+        htmlBlockEndPattern = undefined;
+      }
       setextCandidate = null;
       continue;
     }
@@ -219,9 +232,18 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
     }
 
     const openingFence = line.text.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (openingFence) {
+    const hasInvalidBacktickInfo = openingFence?.[1][0] === "`" && openingFence[2].includes("`");
+    if (openingFence && !hasInvalidBacktickInfo) {
       fenceCharacter = openingFence[1][0] as "`" | "~";
       fenceLength = openingFence[1].length;
+      setextCandidate = null;
+      continue;
+    }
+
+    const htmlBlockStart = getHtmlBlockEndPattern(line.text, setextCandidate === null);
+    if (htmlBlockStart !== undefined) {
+      const closesOnOpeningLine = htmlBlockStart !== null && htmlBlockStart.test(line.text);
+      htmlBlockEndPattern = closesOnOpeningLine ? undefined : htmlBlockStart;
       setextCandidate = null;
       continue;
     }
@@ -229,12 +251,12 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
     const setextUnderline = line.text.match(/^ {0,3}(=+|-+)[ \t]*$/);
     if (setextUnderline && setextCandidate !== null) {
       addHeading({
-        heading: setextCandidate.heading,
+        heading: setextCandidate.paragraphLines.join(" "),
         level: setextUnderline[1][0] === "=" ? 1 : 2,
         style: "setext",
-        startLine: setextCandidate.line.lineNumber,
+        startLine: setextCandidate.firstLine.lineNumber,
         endLine: line.lineNumber,
-        startOffset: setextCandidate.line.startOffset,
+        startOffset: setextCandidate.firstLine.startOffset,
         endOffset: line.endOffset,
       });
       setextCandidate = null;
@@ -259,9 +281,21 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
     }
 
     const candidateHeading = line.text.trim();
-    setextCandidate = candidateHeading.length > 0
-      ? { line, heading: candidateHeading }
-      : null;
+    const isIndentedCode = /^(?: {4}| {0,3}\t)/.test(line.text);
+    const isThematicBreak = /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(line.text);
+    const isParagraphBoundary = /^ {0,3}(?:>|[-+*][ \t]+|\d{1,9}[.)][ \t]+)/.test(line.text);
+    if (
+      candidateHeading.length === 0
+      || isIndentedCode
+      || isThematicBreak
+      || isParagraphBoundary
+    ) {
+      setextCandidate = null;
+    } else if (setextCandidate === null) {
+      setextCandidate = { firstLine: line, paragraphLines: [candidateHeading] };
+    } else {
+      setextCandidate.paragraphLines.push(candidateHeading);
+    }
   }
 
   return headings;
@@ -337,6 +371,36 @@ export function getSectionExportPaths(
     markdownPath: `${stem}.section.md`,
     pdfPath: `${stem}.bookmarked.pdf`,
   };
+}
+
+function getHtmlBlockEndPattern(
+  line: string,
+  allowTypeSeven: boolean,
+): HtmlBlockEndPattern | undefined {
+  const typeOne = line.match(/^ {0,3}<(script|pre|style|textarea)(?:[ \t]|>|$)/i);
+  if (typeOne) {
+    return new RegExp(`</${typeOne[1]}\\s*>`, "i");
+  }
+  if (/^ {0,3}<!--/.test(line)) {
+    return /-->/;
+  }
+  if (/^ {0,3}<\?/.test(line)) {
+    return /\?>/;
+  }
+  if (/^ {0,3}<![A-Z]/.test(line)) {
+    return />/;
+  }
+  if (/^ {0,3}<!\[CDATA\[/.test(line)) {
+    return /\]\]>/;
+  }
+  if (/^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t]|\/?>|$)/i.test(line)) {
+    return null;
+  }
+  const completeTypeSevenTag = /^ {0,3}(?:<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>|<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:"[^"]*"|'[^']*'|[^ \t\r\n"'=<>`]+))?)*[ \t]*\/?>)[ \t]*$/;
+  if (allowTypeSeven && completeTypeSevenTag.test(line)) {
+    return null;
+  }
+  return undefined;
 }
 
 function splitMarkdownLines(markdown: string): MarkdownLine[] {

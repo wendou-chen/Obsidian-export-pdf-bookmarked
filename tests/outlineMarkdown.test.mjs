@@ -294,6 +294,183 @@ try {
   assert.equal(setextHeadings[0].startOffset, 0);
   assert.equal(setextHeadings[0].endOffset, "Setext one\n===========".length);
 
+  const multilineSetextMarkdown = "Foo\nbar\n===\ntail";
+  assert.deepEqual(parseMarkdownHeadingRanges(multilineSetextMarkdown), [
+    {
+      heading: "Foo bar",
+      level: 1,
+      style: "setext",
+      startLine: 0,
+      endLine: 2,
+      startOffset: 0,
+      endOffset: "Foo\nbar\n===".length,
+      ordinal: 0,
+    },
+  ]);
+  assert.deepEqual(parseMarkdownHeadingRanges("Foo\n\nbar\n==="), [
+    {
+      heading: "bar",
+      level: 1,
+      style: "setext",
+      startLine: 2,
+      endLine: 3,
+      startOffset: "Foo\n\n".length,
+      endOffset: "Foo\n\nbar\n===".length,
+      ordinal: 0,
+    },
+  ]);
+  assert.deepEqual(parseMarkdownHeadingRanges("Foo\n- list item\n===\n> quote\n---"), []);
+
+  for (const thematicMarkdown of ["***\nFoo\n---", "---\nFoo\n===", "* * *\nFoo\n---", "_  _  _\nFoo\n==="]) {
+    const fooOffset = thematicMarkdown.indexOf("Foo");
+    const underline = thematicMarkdown.endsWith("---") ? "---" : "===";
+    assert.deepEqual(parseMarkdownHeadingRanges(thematicMarkdown), [
+      {
+        heading: "Foo",
+        level: underline === "---" ? 2 : 1,
+        style: "setext",
+        startLine: 1,
+        endLine: 2,
+        startOffset: fooOffset,
+        endOffset: thematicMarkdown.lastIndexOf(underline) + underline.length,
+        ordinal: 0,
+      },
+    ]);
+  }
+
+  const htmlSetextCases = [
+    "<div>\nFoo\n</div>\n---",
+    " <!-- comment\nFoo\n-->\n---",
+    "  <!DOCTYPE\nFoo\n>\n---",
+    "<?processing\nFoo\n?>\n---",
+    "<![CDATA[\nFoo\n]]>\n---",
+    "<script>\nFoo\n</script>\n---",
+  ];
+  for (const htmlMarkdown of htmlSetextCases) {
+    assert.deepEqual(parseMarkdownHeadingRanges(htmlMarkdown), [], htmlMarkdown);
+  }
+
+  for (const typeSevenMarkdown of [
+    "<span>\nFoo\n</span>\n---",
+    "</span>\nFoo\n---",
+    "<x-card>\nFoo\n</x-card>\n===",
+  ]) {
+    assert.deepEqual(parseMarkdownHeadingRanges(typeSevenMarkdown), [], typeSevenMarkdown);
+  }
+
+  const typeSevenEndsAtBlank = "<x-card>\nignored\n\nFoo\n---";
+  assert.deepEqual(
+    parseMarkdownHeadings(typeSevenEndsAtBlank),
+    [{ heading: "Foo", level: 2 }],
+  );
+
+  const inlineHtmlSetext = "Foo <span>bar</span>\nBaz\n---";
+  assert.deepEqual(parseMarkdownHeadingRanges(inlineHtmlSetext), [
+    {
+      heading: "Foo <span>bar</span> Baz",
+      level: 2,
+      style: "setext",
+      startLine: 0,
+      endLine: 2,
+      startOffset: 0,
+      endOffset: inlineHtmlSetext.length,
+      ordinal: 0,
+    },
+  ]);
+
+  const htmlRangeMarkdown = [
+    "# Root",
+    "root body",
+    "<div>",
+    "Foo",
+    "</div>",
+    "---",
+    "",
+    "# Next",
+    "next body",
+  ].join("\n");
+  const htmlRangeHeadings = parseMarkdownHeadingRanges(htmlRangeMarkdown);
+  assert.deepEqual(
+    htmlRangeHeadings.map(({ heading, level, startLine, startOffset }) => ({
+      heading,
+      level,
+      startLine,
+      startOffset,
+    })),
+    [
+      { heading: "Root", level: 1, startLine: 0, startOffset: 0 },
+      {
+        heading: "Next",
+        level: 1,
+        startLine: 7,
+        startOffset: htmlRangeMarkdown.indexOf("# Next"),
+      },
+    ],
+  );
+  assert.equal(
+    sliceMarkdownSection(htmlRangeMarkdown, htmlRangeHeadings, htmlRangeHeadings[0]),
+    htmlRangeMarkdown.slice(0, htmlRangeMarkdown.indexOf("# Next")),
+  );
+  assert.equal(
+    sliceMarkdownSection(htmlRangeMarkdown, htmlRangeHeadings, htmlRangeHeadings[1]),
+    "# Next\nnext body",
+  );
+
+  assert.deepEqual(
+    parseMarkdownHeadingRanges("    indented code\n----\n\tTabbed code\n===="),
+    [],
+  );
+
+  const atxSpacingCases = [];
+  for (let level = 1; level <= 6; level += 1) {
+    for (let spaces = 0; spaces <= 3; spaces += 1) {
+      atxSpacingCases.push({
+        markdown: `${" ".repeat(spaces)}${"#".repeat(level)} H${level}-${spaces}`,
+        expected: { heading: `H${level}-${spaces}`, level },
+      });
+    }
+    atxSpacingCases.push({
+      markdown: `    ${"#".repeat(level)} Rejected H${level}`,
+      expected: null,
+    });
+  }
+  for (const { markdown, expected } of atxSpacingCases) {
+    const parsed = parseMarkdownHeadingRanges(markdown);
+    assert.deepEqual(
+      parsed.map(({ heading, level }) => ({ heading, level })),
+      expected === null ? [] : [expected],
+      markdown,
+    );
+  }
+
+  const lfOffsetMarkdown = "preamble\n  ## ATX heading ##\nbody\n\nSetext heading\n-----\ntail";
+  const lfOffsetHeadings = parseMarkdownHeadingRanges(lfOffsetMarkdown);
+  assert.deepEqual(
+    lfOffsetHeadings.map(({ heading, startLine, endLine, startOffset, endOffset }) => ({
+      heading,
+      startLine,
+      endLine,
+      startOffset,
+      endOffset,
+    })),
+    [
+      {
+        heading: "ATX heading",
+        startLine: 1,
+        endLine: 1,
+        startOffset: lfOffsetMarkdown.indexOf("  ## ATX heading ##"),
+        endOffset: lfOffsetMarkdown.indexOf("  ## ATX heading ##") + "  ## ATX heading ##".length,
+      },
+      {
+        heading: "Setext heading",
+        startLine: 4,
+        endLine: 5,
+        startOffset: lfOffsetMarkdown.indexOf("Setext heading"),
+        endOffset: lfOffsetMarkdown.indexOf("-----") + "-----".length,
+      },
+    ],
+  );
+
   const protectedMarkdown = [
     "---",
     "title: '# YAML heading'",
@@ -319,7 +496,41 @@ try {
     { heading: "After tilde fence", level: 3 },
   ]);
 
-  const crlfMarkdown = "# First\r\nbody\r\nSecond\r\n------\r\n## Third";
+  const strictTildeFenceMarkdown = [
+    "~~~~",
+    "## Fake in tilde fence",
+    "`````",
+    "### Still fake after other marker",
+    "~~~",
+    "#### Still fake after short close",
+    "~~~~~",
+    "## Real after tilde fence",
+  ].join("\n");
+  assert.deepEqual(parseMarkdownHeadings(strictTildeFenceMarkdown), [
+    { heading: "Real after tilde fence", level: 2 },
+  ]);
+
+  for (const newline of ["\n", "\r\n"]) {
+    const invalidBacktickInfoFence = [
+      "```lang`invalid",
+      "# Real heading",
+    ].join(newline);
+    assert.deepEqual(parseMarkdownHeadings(invalidBacktickInfoFence), [
+      { heading: "Real heading", level: 1 },
+    ]);
+  }
+
+  const tildeInfoWithBacktick = [
+    "~~~ lang`allowed",
+    "# Fake in tilde fence",
+    "~~~",
+    "# Real after tilde fence",
+  ].join("\n");
+  assert.deepEqual(parseMarkdownHeadings(tildeInfoWithBacktick), [
+    { heading: "Real after tilde fence", level: 1 },
+  ]);
+
+  const crlfMarkdown = "# First\r\nbody\r\n\r\nSecond\r\n------\r\n## Third";
   const crlfHeadings = parseMarkdownHeadingRanges(crlfMarkdown);
   assert.deepEqual(
     crlfHeadings.map(({ heading, startLine, endLine, startOffset, endOffset }) => ({
@@ -333,15 +544,15 @@ try {
       { heading: "First", startLine: 0, endLine: 0, startOffset: 0, endOffset: 7 },
       {
         heading: "Second",
-        startLine: 2,
-        endLine: 3,
+        startLine: 3,
+        endLine: 4,
         startOffset: crlfMarkdown.indexOf("Second"),
         endOffset: crlfMarkdown.indexOf("------") + "------".length,
       },
       {
         heading: "Third",
-        startLine: 4,
-        endLine: 4,
+        startLine: 5,
+        endLine: 5,
         startOffset: crlfMarkdown.indexOf("## Third"),
         endOffset: crlfMarkdown.length,
       },
