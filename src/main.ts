@@ -1,14 +1,13 @@
 import {
   App,
-  Component,
   FuzzySuggestModal,
-  MarkdownRenderer,
   MarkdownView,
   Notice,
   Platform,
   Plugin,
   TAbstractFile,
   TFile,
+  WorkspaceLeaf,
   loadPdfJs,
   normalizePath,
 } from "obsidian";
@@ -34,46 +33,74 @@ import {
 } from "./outlineMarkdown";
 import {
   addPdfBookmarks,
-  finalizeBookmarkedPdf,
-  PDF_PRINT_ANCHOR_URI_PREFIX,
-  getPdfPrintAnchorDescriptor,
-  type PdfAnchorTarget,
-  type PdfPrintAnchorOptions,
 } from "./pdfOutline";
+import {
+  getNativeTempMarkdownPath,
+  getNativeTempPdfFileName,
+  injectPdfBookmarkMarkers,
+  mapPdfBookmarkMarkersToPages,
+  restorePdfIncludeName,
+  shouldRetryNativeTempPdfCleanup,
+  snapshotPdfIncludeName,
+  type PdfBookmarkMarker,
+  withTimeout,
+} from "./nativePdfExport";
 import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
 import { SerialTaskQueue } from "./serialTaskQueue";
 
 type CurrentFileAction = "copy" | "export" | "bookmarked-pdf" | "pdf";
 
-interface PrintToPdfWebContents {
-  printToPDF(options: Record<string, unknown>): Promise<ArrayBuffer | Uint8Array>;
+interface SaveDialogResult {
+  canceled: boolean;
+  filePath?: string;
+}
+
+interface ElectronDialogLike {
+  showSaveDialog(...args: unknown[]): Promise<SaveDialogResult>;
 }
 
 interface ElectronRemoteLike {
-  getCurrentWebContents?: () => PrintToPdfWebContents;
-  getCurrentWindow?: () => { webContents?: PrintToPdfWebContents };
+  dialog?: ElectronDialogLike;
 }
 
 type WindowWithRequire = Window & {
   require?: (moduleName: string) => unknown;
 };
 
-const PRINT_CONTAINER_CLASS = "outline-markdown-export-print-root";
-const PRINT_ANCHOR_CLASS = "outline-markdown-export-print-anchor";
-// Electron 的 generateDocumentOutline 存在静默失效问题（electron/electron#45124），
-// 书签不依赖它，由 finalizeBookmarkedPdf 通过锚点回读自行写入 /Outlines。
-// 关键：锚点不能用 opacity:0/visibility:hidden/display:none，否则 Chromium
-// 不会为其生成 PDF Link annotation（better-export-pdf 的实测结论）。
-const PDF_PRINT_OPTIONS: Record<string, unknown> = {
-  pageSize: "A4",
-  landscape: false,
-  printBackground: true,
-  preferCSSPageSize: true,
-};
+interface NativePdfMarkdownView extends MarkdownView {
+  printToPdf?: () => void;
+}
+
+interface NodeFileSystemLike {
+  existsSync(path: string): boolean;
+  readFileSync(path: string): Uint8Array;
+  promises: {
+    unlink(path: string): Promise<void>;
+  };
+}
+
+interface NodeTimersLike {
+  setTimeout(callback: () => void, milliseconds: number): unknown;
+  clearTimeout(timeoutId: unknown): void;
+}
+
+interface VaultConfigLike {
+  getConfig(key: string): unknown;
+  setConfig(key: string, value: unknown): void;
+}
+
+const NATIVE_EXPORT_MODAL_TIMEOUT_MS = 5000;
+const NATIVE_EXPORT_FILE_TIMEOUT_MS = 120000;
+const NATIVE_EXPORT_WATCH_INTERVAL_MS = 250;
 
 export default class OutlineMarkdownExportPlugin extends Plugin {
-  private readonly pdfPrintQueue = new SerialTaskQueue();
+  private readonly pdfExportQueue = new SerialTaskQueue();
+  private unloaded = false;
+  private activeNativeExportCleanup: (() => void) | null = null;
+
   async onload(): Promise<void> {
+    this.unloaded = false;
+    this.activeNativeExportCleanup = null;
     this.addCommand({
       id: "copy-current-outline-markdown",
       name: "复制当前文件大纲 Markdown",
@@ -188,6 +215,12 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     });
   }
 
+  onunload(): void {
+    this.unloaded = true;
+    this.activeNativeExportCleanup?.();
+    this.activeNativeExportCleanup = null;
+  }
+
   private async resolveSelectedSection(selection: OutlineHeadingSelection): Promise<{
     section: string;
     selected: MarkdownHeadingRange;
@@ -247,16 +280,21 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       const resolved = await this.resolveSelectedSection(selection);
       if (!resolved) return;
       const printable = getPrintableSectionPdfMarkdown(resolved.section, selection.file.basename);
-      const printed = await this.printMarkdownToPdf(selection.file, printable, { syntheticRootHeading: true });
-      const finalized = await finalizeBookmarkedPdf(printed.pdfBytes, printed.anchors);
+      const prepared = this.prepareBookmarkedNativeMarkdown(printable);
       const path = normalizePath(getSectionExportPaths(
         selection.file.path, resolved.selected, resolved.appendOrdinal,
       ).pdfPath);
-      await this.writeBinaryVaultFile(path, this.toArrayBuffer(finalized.bytes));
-      if (finalized.matchedCount > 0) {
-        new Notice(`已导出此节带书签 PDF（${finalized.matchedCount} 个书签）：${path}`);
+      const bookmarkResult = await this.exportBookmarkedNativePdf(
+        selection.file,
+        prepared.markdown,
+        printable,
+        prepared.markers,
+        path,
+      );
+      if (bookmarkResult.matchedCount > 0) {
+        new Notice(`已导出此节带书签 PDF（${bookmarkResult.matchedCount} 个书签）：${path}`);
       } else {
-        new Notice(`已导出此节 PDF，但未能定位标题锚点，未生成书签：${path}`);
+        throw new Error("未生成任何 PDF 书签");
       }
     } catch (error) {
       console.error("Failed to export outline section PDF", error);
@@ -373,17 +411,20 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     try {
       const markdown = await this.getMarkdownContent(file);
       const printableMarkdown = getPrintableBookmarkedPdfMarkdown(markdown, file.basename);
-      const printed = await this.printMarkdownToPdf(file, printableMarkdown);
-      const finalized = await finalizeBookmarkedPdf(printed.pdfBytes, printed.anchors);
+      const prepared = this.prepareBookmarkedNativeMarkdown(printableMarkdown);
       const outputPath = normalizePath(getBookmarkedPdfExportPath(file.path));
-      await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(finalized.bytes));
+      const bookmarkResult = await this.exportBookmarkedNativePdf(
+        file,
+        prepared.markdown,
+        printableMarkdown,
+        prepared.markers,
+        outputPath,
+      );
 
-      if (finalized.matchedCount > 0) {
-        new Notice(`已导出带书签 PDF（${finalized.matchedCount} 个书签）：${outputPath}`);
+      if (bookmarkResult.matchedCount > 0) {
+        new Notice(`已导出带书签 PDF（${bookmarkResult.matchedCount} 个书签）：${outputPath}`);
       } else {
-        new Notice(
-          `已导出 PDF，但未能定位标题锚点。可改用「给已有 PDF 注入书签」：${outputPath}`,
-        );
+        throw new Error("未生成任何 PDF 书签");
       }
     } catch (error) {
       console.error("Failed to export bookmarked PDF", error);
@@ -392,170 +433,418 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     }
   }
 
-  private printMarkdownToPdf(
+  private exportBookmarkedNativePdf(
     file: TFile,
-    markdown: string,
-    options: PdfPrintAnchorOptions = {},
-  ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
-    return this.pdfPrintQueue.run(() => this.printMarkdownToPdfSerial(file, markdown, options));
+    printableMarkdown: string,
+    bookmarkMarkdown: string,
+    markers: PdfBookmarkMarker[],
+    outputPath: string,
+  ): Promise<{ matchedCount: number }> {
+    return this.pdfExportQueue.run(async () => {
+      this.assertPluginLoaded();
+      const nativePdfBytes = await this.exportMarkdownWithObsidianNativePdfSerial(file, printableMarkdown);
+      return await this.writeBookmarkedNativePdf(outputPath, nativePdfBytes, bookmarkMarkdown, markers);
+    });
   }
 
-  private async printMarkdownToPdfSerial(
-    file: TFile,
+  private async exportMarkdownWithObsidianNativePdfSerial(
+    sourceFile: TFile,
     markdown: string,
-    options: PdfPrintAnchorOptions,
-  ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
-    const webContents = this.getCurrentWebContents();
-    if (!webContents) {
-      throw new Error("无法访问 Electron printToPDF，请确认正在 Obsidian 桌面端运行");
+  ): Promise<Uint8Array> {
+    const requireFn = (window as WindowWithRequire).require?.bind(window);
+    const remote = this.getElectronRemote();
+    const dialog = remote?.dialog;
+    if (!requireFn || !dialog) {
+      throw new Error("无法调用 Obsidian 原生 PDF 导出，请确认正在桌面端运行");
     }
 
-    const component = new Component();
-    const { wrapper, content } = this.createPrintContainer();
-    const style = this.injectPrintStyle();
-    component.load();
+    const fileSystem = requireFn("fs") as NodeFileSystemLike;
+    const nodeTimers = requireFn("timers") as NodeTimersLike;
+    const os = requireFn("os") as { tmpdir(): string };
+    const path = requireFn("path") as { join(...parts: string[]): string };
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tempMarkdownPath = normalizePath(getNativeTempMarkdownPath(sourceFile.path, token));
+    const tempPdfPath = path.join(os.tmpdir(), getNativeTempPdfFileName(token));
+    let tempFile: TFile | null = null;
+    let tempLeaf: WorkspaceLeaf | null = null;
+    let nativeModal: HTMLElement | null = null;
+    let existingModals: ReadonlySet<HTMLElement> | null = null;
+    let originalShowSaveDialog: ElectronDialogLike["showSaveDialog"] | null = null;
+    let saveDialogWrapper: ElectronDialogLike["showSaveDialog"] | null = null;
+    let saveDialogInterceptorActive = false;
+    let lateModalObserver: MutationObserver | null = null;
+    let lateModalObserverTimeout: number | null = null;
+    const vaultConfig = this.app.vault as typeof this.app.vault & VaultConfigLike;
+    const pdfIncludeNameSnapshot = snapshotPdfIncludeName(vaultConfig.getConfig("pdfExportSettings"));
+    let pdfIncludeNameTouched = false;
+    let pdfIncludeNameRestored = false;
+    const restoreIncludeNameSetting = (): void => {
+      if (!pdfIncludeNameTouched || pdfIncludeNameRestored) return;
+      const currentSettings = vaultConfig.getConfig("pdfExportSettings");
+      vaultConfig.setConfig(
+        "pdfExportSettings",
+        restorePdfIncludeName(currentSettings, pdfIncludeNameSnapshot),
+      );
+      pdfIncludeNameRestored = true;
+    };
+    let rejectActiveWait: ((error: Error) => void) | null = null;
+    const stopLateModalObserver = (): void => {
+      lateModalObserver?.disconnect();
+      lateModalObserver = null;
+      if (lateModalObserverTimeout !== null) {
+        window.clearTimeout(lateModalObserverTimeout);
+        lateModalObserverTimeout = null;
+      }
+    };
+    const observeLateModal = (): void => {
+      if (lateModalObserver || !existingModals || !tempFile) return;
+      lateModalObserver = new MutationObserver(() => {
+        if (!existingModals || !tempFile) return;
+        const lateModal = this.findNativeExportModal(existingModals, tempFile.basename);
+        if (!lateModal) return;
+        this.closeNativeExportModal(lateModal);
+        stopLateModalObserver();
+      });
+      lateModalObserver.observe(document.body, { childList: true, subtree: true });
+      lateModalObserverTimeout = window.setTimeout(stopLateModalObserver, NATIVE_EXPORT_MODAL_TIMEOUT_MS);
+    };
+    const cleanupRuntime = (): void => {
+      saveDialogInterceptorActive = false;
+      rejectActiveWait?.(new Error("插件已卸载，已取消原生 PDF 导出"));
+      rejectActiveWait = null;
+      if (originalShowSaveDialog && saveDialogWrapper && dialog.showSaveDialog === saveDialogWrapper) {
+        dialog.showSaveDialog = originalShowSaveDialog;
+      }
+      restoreIncludeNameSetting();
+      const modalToClose = nativeModal ?? (
+        existingModals && tempFile
+          ? this.findNativeExportModal(existingModals, tempFile.basename)
+          : null
+      );
+      if (modalToClose) {
+        this.closeNativeExportModal(modalToClose);
+        stopLateModalObserver();
+      } else {
+        observeLateModal();
+      }
+      tempLeaf?.detach();
+    };
+    this.activeNativeExportCleanup = cleanupRuntime;
+
+    new Notice("正在使用 Obsidian 原生方式导出 PDF，期间界面可能暂时无响应", 8000);
 
     try {
-      await MarkdownRenderer.render(this.app, markdown, content, file.path, component);
-      const anchors = this.injectHeadingPrintAnchors(content, options);
-      await this.waitForRenderToSettle(content);
+      tempFile = await this.app.vault.create(tempMarkdownPath, markdown);
+      this.assertPluginLoaded();
+      tempLeaf = this.app.workspace.getLeaf("tab");
+      await tempLeaf.openFile(tempFile, { active: true });
+      this.assertPluginLoaded();
+      await this.delayWithNodeTimers(nodeTimers, 1500);
+      this.assertPluginLoaded();
 
-      const pdfData = await webContents.printToPDF(PDF_PRINT_OPTIONS);
-      const pdfBytes = pdfData instanceof Uint8Array ? pdfData : new Uint8Array(pdfData);
-      return { pdfBytes, anchors };
+      const nativeView = tempLeaf.view as NativePdfMarkdownView;
+      if (!(nativeView instanceof MarkdownView) || typeof nativeView.printToPdf !== "function") {
+        throw new Error("无法打开 Obsidian 原生 Markdown 导出视图");
+      }
+
+      const currentSettings = vaultConfig.getConfig("pdfExportSettings");
+      pdfIncludeNameTouched = true;
+      pdfIncludeNameRestored = false;
+      vaultConfig.setConfig("pdfExportSettings", {
+        ...(typeof currentSettings === "object" && currentSettings !== null
+          ? currentSettings as Record<string, unknown>
+          : {}),
+        includeName: false,
+      });
+      existingModals = new Set(document.querySelectorAll<HTMLElement>(".modal-container"));
+      nativeView.printToPdf();
+      nativeModal = await this.waitForNativeExportModal(existingModals, tempFile.basename);
+      this.assertPluginLoaded();
+      this.configureNativeExportModal(nativeModal);
+
+      let resolveSaveDialogCalled: (() => void) | null = null;
+      const saveDialogCalled = new Promise<void>((resolve) => {
+        resolveSaveDialogCalled = resolve;
+      });
+      originalShowSaveDialog = dialog.showSaveDialog;
+      saveDialogInterceptorActive = true;
+      saveDialogWrapper = async (...args: unknown[]): Promise<SaveDialogResult> => {
+        if (!saveDialogInterceptorActive) {
+          return originalShowSaveDialog?.apply(dialog, args) ?? { canceled: true };
+        }
+        const options = args.find((argument) => (
+          typeof argument === "object" && argument !== null && "defaultPath" in argument
+        )) as {
+          defaultPath?: unknown;
+          filters?: Array<{ extensions?: string[] }>;
+        } | undefined;
+        const expectedDefaultPath = `${tempFile?.basename ?? ""}.pdf`;
+        const isExpectedPdfDialog = typeof options?.defaultPath === "string" &&
+          options.defaultPath.replace(/\\/g, "/").endsWith(expectedDefaultPath) &&
+          (options.filters?.some((filter) => filter.extensions?.includes("pdf")) ?? false);
+        if (!isExpectedPdfDialog) {
+          return originalShowSaveDialog?.apply(dialog, args) ?? { canceled: true };
+        }
+        resolveSaveDialogCalled?.();
+        return { canceled: false, filePath: tempPdfPath };
+      };
+      dialog.showSaveDialog = saveDialogWrapper;
+      const exportButton = nativeModal.querySelector<HTMLButtonElement>("button.mod-cta") ??
+        Array.from(nativeModal.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent === "导出" || button.textContent === "Export");
+      if (!exportButton) {
+        throw new Error("未找到 Obsidian 原生导出按钮");
+      }
+      exportButton.click();
+      restoreIncludeNameSetting();
+
+      const cancelled = new Promise<void>((_resolve, reject) => {
+        rejectActiveWait = reject;
+      });
+      await Promise.race([
+        withTimeout(saveDialogCalled, NATIVE_EXPORT_MODAL_TIMEOUT_MS, "原生 PDF 保存对话框未响应"),
+        cancelled,
+      ]);
+      rejectActiveWait = null;
+      this.assertPluginLoaded();
+      saveDialogInterceptorActive = false;
+      if (dialog.showSaveDialog === saveDialogWrapper) {
+        dialog.showSaveDialog = originalShowSaveDialog;
+      }
+      return await this.waitForCompleteNativePdf(fileSystem, tempPdfPath, nodeTimers);
     } finally {
-      component.unload();
-      wrapper.remove();
-      style.remove();
+      cleanupRuntime();
+      if (this.activeNativeExportCleanup === cleanupRuntime) {
+        this.activeNativeExportCleanup = null;
+      }
+      const currentTempFile = this.app.vault.getAbstractFileByPath(tempMarkdownPath);
+      if (tempFile && currentTempFile === tempFile) {
+        await this.app.vault.delete(tempFile, true).catch(() => undefined);
+      }
+      void this.cleanupNativeTempPdf(fileSystem, tempPdfPath, nodeTimers);
     }
   }
 
-  // Chromium printToPDF 会为"可见的" <a> 链接生成 PDF Link annotation，
-  // 但跳过 opacity:0 / visibility:hidden / display:none 的元素。
-  // 因此锚点用 position:absolute; width:1px; height:1px; right:0 实现视觉隐藏，
-  // 保证 Chromium 将其视为"已渲染的可交互元素"并写入 Link annotation。
-  // 参考：obsidian-better-export-pdf 的 CSS_PATCH / styles.css。
-  private injectHeadingPrintAnchors(
-    container: HTMLElement,
-    options: PdfPrintAnchorOptions = {},
-  ): PdfAnchorTarget[] {
-    const anchors: PdfAnchorTarget[] = [];
-    const headings = Array.from(container.querySelectorAll<HTMLElement>("h1, h2, h3"));
-
-    headings.forEach((heading, headingIndex) => {
-      const descriptor = getPdfPrintAnchorDescriptor(
-        heading.textContent ?? "", Number(heading.tagName.slice(1)), headingIndex, options,
-      );
-      if (!descriptor) return;
-
-      const key = `omx-${anchors.length}`;
-      const anchor = document.createElement("a");
-      anchor.href = `${PDF_PRINT_ANCHOR_URI_PREFIX}${key}`;
-      anchor.className = PRINT_ANCHOR_CLASS;
-      heading.style.position = "relative";
-      heading.prepend(anchor);
-      anchors.push({ key, ...descriptor });
-    });
-
-    return anchors;
-  }
-
-  // Obsidian 的打印样式表在 @media print 下只放行 `body > .print`，其余一律
-  // display:none !important；容器必须复用 `.print > .markdown-preview-view`
-  // 结构才能进入打印输出（v1/v3 白页的根因）。
-  private createPrintContainer(): { wrapper: HTMLElement; content: HTMLElement } {
-    const wrapper = document.createElement("div");
-    wrapper.className = `print ${PRINT_CONTAINER_CLASS}`;
-
-    const content = document.createElement("div");
-    content.className = "markdown-preview-view markdown-rendered";
-    wrapper.appendChild(content);
-    document.body.appendChild(wrapper);
-
-    return { wrapper, content };
-  }
-
-  private injectPrintStyle(): HTMLStyleElement {
-    const style = document.createElement("style");
-    style.textContent = `
-      @page {
-        size: A4 portrait;
-        margin: 16mm;
-      }
-
-      .${PRINT_CONTAINER_CLASS} {
-        display: none;
-      }
-
-      @media print {
-        .${PRINT_CONTAINER_CLASS} {
-          display: block !important;
-          background: #ffffff !important;
-        }
-
-        .${PRINT_CONTAINER_CLASS} .${PRINT_ANCHOR_CLASS} {
-          white-space: pre !important;
-          border-left: none !important;
-          border-right: none !important;
-          border-top: none !important;
-          border-bottom: none !important;
-          display: inline-block !important;
-          position: absolute !important;
-          width: 1px !important;
-          height: 1px !important;
-          right: 0 !important;
-          outline: 0 !important;
-          background: 0 0 !important;
-          text-decoration: initial !important;
-          text-shadow: initial !important;
-        }
-      }
-    `;
-    document.head.appendChild(style);
-    return style;
-  }
-
-  private async waitForRenderToSettle(container: HTMLElement): Promise<void> {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-
-    const fonts = (document as Document & { fonts?: { ready?: Promise<unknown> } }).fonts;
-    await fonts?.ready?.catch(() => undefined);
-
-    // MathJax 排版是异步的，字体/图片就绪后再留一小段静置时间。
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 400));
-
-    const imagePromises = Array.from(container.querySelectorAll("img"))
-      .filter((image) => !image.complete)
-      .map((image) => new Promise<void>((resolve) => {
-        const finish = (): void => resolve();
-        image.addEventListener("load", finish, { once: true });
-        image.addEventListener("error", finish, { once: true });
-      }));
-
-    if (imagePromises.length === 0) {
-      return;
-    }
-
-    await Promise.race([
-      Promise.all(imagePromises),
-      new Promise<void>((resolve) => window.setTimeout(resolve, 3000)),
-    ]);
-  }
-
-  private getCurrentWebContents(): PrintToPdfWebContents | null {
+  private getElectronRemote(): ElectronRemoteLike | null {
     const requireFn = (window as WindowWithRequire).require?.bind(window);
-    if (!requireFn) {
-      return null;
-    }
-
+    if (!requireFn) return null;
     try {
       const electron = requireFn("electron") as { remote?: ElectronRemoteLike } | null;
-      const remote = electron?.remote ?? (requireFn("@electron/remote") as ElectronRemoteLike | null);
-      return remote?.getCurrentWebContents?.() ?? remote?.getCurrentWindow?.().webContents ?? null;
+      return electron?.remote ?? (requireFn("@electron/remote") as ElectronRemoteLike | null);
     } catch (error) {
-      console.error("Failed to access Electron webContents", error);
+      console.error("Failed to access Electron remote", error);
       return null;
     }
+  }
+
+  private async waitForNativeExportModal(
+    existingModals: ReadonlySet<HTMLElement>,
+    tempBasename: string,
+  ): Promise<HTMLElement> {
+    const deadline = Date.now() + NATIVE_EXPORT_MODAL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      this.assertPluginLoaded();
+      const modal = this.findNativeExportModal(existingModals, tempBasename);
+      if (modal) return modal;
+      await this.delay(100);
+    }
+    throw new Error("Obsidian 原生 PDF 导出窗口未打开");
+  }
+
+  private findNativeExportModal(
+    existingModals: ReadonlySet<HTMLElement>,
+    tempBasename: string,
+  ): HTMLElement | null {
+    return Array.from(document.querySelectorAll<HTMLElement>(".modal-container"))
+      .find((candidate) => (
+        !existingModals.has(candidate) && candidate.textContent?.includes(tempBasename)
+      )) ?? null;
+  }
+
+  private configureNativeExportModal(modal: HTMLElement): void {
+    const configured = this.setNativeExportCheckbox(
+      modal,
+      ["将文件名作为标题", "将笔记名作为标题", "Include file name as title", "Include note name as title"],
+      0,
+      false,
+    );
+    if (!configured) {
+      throw new Error("无法关闭原生导出的临时文件名标题");
+    }
+  }
+
+  private setNativeExportCheckbox(
+    modal: HTMLElement,
+    labels: string[],
+    fallbackIndex: number,
+    checked: boolean,
+  ): boolean {
+    const setting = Array.from(modal.querySelectorAll<HTMLElement>(".setting-item"))
+      .find((item) => labels.some((label) => item.textContent?.includes(label)));
+    const allCheckboxes = Array.from(modal.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'));
+    const checkbox = setting?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? allCheckboxes[fallbackIndex];
+    if (!checkbox) return false;
+    if (checkbox && checkbox.checked !== checked) {
+      checkbox.click();
+    }
+    return checkbox.checked === checked;
+  }
+
+  private closeNativeExportModal(modal: HTMLElement | null): void {
+    if (!modal?.isConnected) return;
+    const closeButton = modal.querySelector<HTMLElement>(".modal-close-button");
+    if (closeButton) {
+      closeButton.click();
+      return;
+    }
+    const cancelButton = Array.from(modal.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "取消" || button.textContent === "Cancel");
+    cancelButton?.click();
+  }
+
+  private async waitForCompleteNativePdf(
+    fileSystem: NodeFileSystemLike,
+    pdfPath: string,
+    nodeTimers: NodeTimersLike,
+  ): Promise<Uint8Array> {
+    return await new Promise<Uint8Array>((resolve, reject) => {
+      let settled = false;
+      let pollId: unknown = null;
+      let lastCompleteSize = -1;
+      let stableCompletePolls = 0;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (pollId !== null) nodeTimers.clearTimeout(pollId);
+        nodeTimers.clearTimeout(timeoutId);
+        callback();
+      };
+      const inspectFile = (): void => {
+        if (settled) return;
+        if (this.unloaded) {
+          finish(() => reject(new Error("插件已卸载，已取消原生 PDF 导出")));
+          return;
+        }
+        const scheduleNext = (): void => {
+          if (!settled) {
+            pollId = nodeTimers.setTimeout(inspectFile, NATIVE_EXPORT_WATCH_INTERVAL_MS);
+          }
+        };
+        if (!fileSystem.existsSync(pdfPath)) {
+          scheduleNext();
+          return;
+        }
+        try {
+          const bytes = new Uint8Array(fileSystem.readFileSync(pdfPath));
+          if (this.isCompletePdf(bytes)) {
+            stableCompletePolls = bytes.length === lastCompleteSize ? stableCompletePolls + 1 : 1;
+            lastCompleteSize = bytes.length;
+            if (stableCompletePolls >= 2) {
+              finish(() => resolve(bytes));
+              return;
+            }
+            scheduleNext();
+            return;
+          }
+          lastCompleteSize = -1;
+          stableCompletePolls = 0;
+          scheduleNext();
+        } catch {
+          scheduleNext();
+        }
+      };
+      const timeoutId = nodeTimers.setTimeout(() => {
+        finish(() => reject(new Error("Obsidian 原生 PDF 导出超时")));
+      }, NATIVE_EXPORT_FILE_TIMEOUT_MS);
+      inspectFile();
+    });
+  }
+
+  private isCompletePdf(bytes: Uint8Array): boolean {
+    if (bytes.length < 8 || String.fromCharCode(...bytes.subarray(0, 5)) !== "%PDF-") {
+      return false;
+    }
+    const tail = bytes.subarray(Math.max(0, bytes.length - 1024));
+    return new TextDecoder("latin1").decode(tail).includes("%%EOF");
+  }
+
+  private async cleanupNativeTempPdf(
+    fileSystem: NodeFileSystemLike,
+    pdfPath: string,
+    nodeTimers: NodeTimersLike,
+  ): Promise<void> {
+    for (const delayMs of [0, 1000, 5000, 30000, 120000]) {
+      if (delayMs > 0) await this.delayWithNodeTimers(nodeTimers, delayMs);
+      if (!fileSystem.existsSync(pdfPath)) return;
+      try {
+        await fileSystem.promises.unlink(pdfPath);
+        return;
+      } catch (error) {
+        if (!shouldRetryNativeTempPdfCleanup(error)) {
+          console.warn("Failed to remove native PDF temp file", pdfPath, error);
+          return;
+        }
+      }
+    }
+    console.warn("Failed to remove native PDF temp file", pdfPath);
+  }
+
+  private async addBookmarksToRenderedPdf(
+    pdfBytes: Uint8Array,
+    markdown: string,
+    markers: PdfBookmarkMarker[],
+  ): Promise<{ bytes: Uint8Array; matchedCount: number; expectedCount: number }> {
+    const pageTexts = await this.extractPdfPageTexts(pdfBytes.slice());
+    const headings = getPdfBookmarkHeadings(parseMarkdownHeadings(markdown));
+    const targets = mapPdfBookmarkMarkersToPages(markers, pageTexts);
+    const title = headings.find((heading) => heading.level === 1)?.heading;
+    return {
+      bytes: await addPdfBookmarks(pdfBytes, targets, { title }),
+      matchedCount: targets.length,
+      expectedCount: markers.length,
+    };
+  }
+
+  private prepareBookmarkedNativeMarkdown(markdown: string): {
+    markdown: string;
+    markers: PdfBookmarkMarker[];
+  } {
+    const headings = parseMarkdownHeadingRanges(markdown)
+      .filter((heading) => getPdfBookmarkHeadings([heading]).length > 0);
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return injectPdfBookmarkMarkers(markdown, headings, token);
+  }
+
+  private async writeBookmarkedNativePdf(
+    outputPath: string,
+    nativePdfBytes: Uint8Array,
+    markdown: string,
+    markers: PdfBookmarkMarker[],
+  ): Promise<{ matchedCount: number }> {
+    this.assertPluginLoaded();
+    if (markers.length === 0) {
+      throw new Error("当前内容没有可写入 PDF 的标题，未生成最终文件");
+    }
+    const finalized = await this.addBookmarksToRenderedPdf(nativePdfBytes.slice(), markdown, markers);
+    if (finalized.matchedCount !== finalized.expectedCount) {
+      throw new Error(
+        `PDF 书签匹配不完整（${finalized.matchedCount}/${finalized.expectedCount}），未写入最终文件`,
+      );
+    }
+
+    this.assertPluginLoaded();
+    await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(finalized.bytes));
+    return { matchedCount: finalized.matchedCount };
+  }
+
+  private delay(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  }
+
+  private delayWithNodeTimers(nodeTimers: NodeTimersLike, milliseconds: number): Promise<void> {
+    return new Promise((resolve) => {
+      nodeTimers.setTimeout(resolve, milliseconds);
+    });
   }
 
   private async addBookmarksToNativePdfForFile(markdownFile: TFile): Promise<void> {
@@ -703,6 +992,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   }
 
   private async writeBinaryVaultFile(path: string, data: ArrayBuffer): Promise<void> {
+    this.assertPluginLoaded();
     const existing = this.app.vault.getAbstractFileByPath(path);
 
     if (existing instanceof TFile) {
@@ -715,6 +1005,12 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     }
 
     await this.app.vault.createBinary(path, data);
+  }
+
+  private assertPluginLoaded(): void {
+    if (this.unloaded) {
+      throw new Error("插件已卸载，已取消导出写入");
+    }
   }
 }
 
