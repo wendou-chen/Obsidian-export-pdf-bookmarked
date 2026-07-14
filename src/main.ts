@@ -42,17 +42,31 @@ import {
 } from "./pdfOutline";
 import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
 import { SerialTaskQueue } from "./serialTaskQueue";
+import { buildPrintDocumentHtml } from "./printWindow";
 
 type CurrentFileAction = "copy" | "export" | "bookmarked-pdf" | "pdf";
 
 interface PrintToPdfWebContents {
   printToPDF(options: Record<string, unknown>): Promise<ArrayBuffer | Uint8Array>;
+  executeJavaScript?(code: string): Promise<unknown>;
+}
+
+interface ElectronPrintWindow {
+  loadFile(filePath: string): Promise<void>;
+  webContents: PrintToPdfWebContents;
+  destroy(): void;
 }
 
 interface ElectronRemoteLike {
-  getCurrentWebContents?: () => PrintToPdfWebContents;
-  getCurrentWindow?: () => { webContents?: PrintToPdfWebContents };
+  BrowserWindow?: new (options: Record<string, unknown>) => ElectronPrintWindow;
 }
+
+type NodeFileSystemLike = {
+  promises: {
+    writeFile(path: string, data: string, encoding: "utf8"): Promise<void>;
+    unlink(path: string): Promise<void>;
+  };
+};
 
 type WindowWithRequire = Window & {
   require?: (moduleName: string) => unknown;
@@ -405,11 +419,6 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     markdown: string,
     options: PdfPrintAnchorOptions,
   ): Promise<{ pdfBytes: Uint8Array; anchors: PdfAnchorTarget[] }> {
-    const webContents = this.getCurrentWebContents();
-    if (!webContents) {
-      throw new Error("无法访问 Electron printToPDF，请确认正在 Obsidian 桌面端运行");
-    }
-
     const component = new Component();
     const { wrapper, content } = this.createPrintContainer();
     const style = this.injectPrintStyle();
@@ -420,7 +429,12 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       const anchors = this.injectHeadingPrintAnchors(content, options);
       await this.waitForRenderToSettle(content);
 
-      const pdfData = await webContents.printToPDF(PDF_PRINT_OPTIONS);
+      const wrapperHtml = await this.clonePrintWrapperWithInlineImages(wrapper);
+      const headHtml = Array.from(document.head.querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
+        'link[rel="stylesheet"], style',
+      )).map((element) => element.outerHTML).join("\n");
+      const html = buildPrintDocumentHtml(headHtml, document.body.className, wrapperHtml);
+      const pdfData = await this.printHtmlInHiddenWindow(html, PDF_PRINT_OPTIONS);
       const pdfBytes = pdfData instanceof Uint8Array ? pdfData : new Uint8Array(pdfData);
       return { pdfBytes, anchors };
     } finally {
@@ -542,7 +556,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     ]);
   }
 
-  private getCurrentWebContents(): PrintToPdfWebContents | null {
+  private getElectronRemote(): ElectronRemoteLike | null {
     const requireFn = (window as WindowWithRequire).require?.bind(window);
     if (!requireFn) {
       return null;
@@ -550,11 +564,91 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
 
     try {
       const electron = requireFn("electron") as { remote?: ElectronRemoteLike } | null;
-      const remote = electron?.remote ?? (requireFn("@electron/remote") as ElectronRemoteLike | null);
-      return remote?.getCurrentWebContents?.() ?? remote?.getCurrentWindow?.().webContents ?? null;
+      return electron?.remote ?? (requireFn("@electron/remote") as ElectronRemoteLike | null);
     } catch (error) {
-      console.error("Failed to access Electron webContents", error);
+      console.error("Failed to access Electron remote", error);
       return null;
+    }
+  }
+
+  private async clonePrintWrapperWithInlineImages(wrapper: HTMLElement): Promise<string> {
+    const clone = wrapper.cloneNode(true) as HTMLElement;
+    const sourceImages = Array.from(wrapper.querySelectorAll<HTMLImageElement>("img"));
+    const clonedImages = Array.from(clone.querySelectorAll<HTMLImageElement>("img"));
+
+    await Promise.all(sourceImages.map(async (sourceImage, index) => {
+      const clonedImage = clonedImages[index];
+      const source = sourceImage.currentSrc || sourceImage.src;
+      if (!clonedImage || !source || source.startsWith("data:")) {
+        return;
+      }
+
+      try {
+        const response = await fetch(source);
+        if (!response.ok) {
+          return;
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+        }
+        const mimeType = response.headers.get("content-type") || "image/png";
+        clonedImage.src = `data:${mimeType};base64,${btoa(binary)}`;
+      } catch (error) {
+        console.warn("Failed to inline print image", source, error);
+      }
+    }));
+
+    return clone.outerHTML;
+  }
+
+  private async printHtmlInHiddenWindow(
+    html: string,
+    options: Record<string, unknown>,
+  ): Promise<ArrayBuffer | Uint8Array> {
+    const requireFn = (window as WindowWithRequire).require?.bind(window);
+    const remote = this.getElectronRemote();
+    const BrowserWindow = remote?.BrowserWindow;
+    if (!requireFn || !BrowserWindow) {
+      throw new Error("无法创建隐藏打印窗口，请确认正在 Obsidian 桌面端运行");
+    }
+
+    const fileSystem = requireFn("fs") as NodeFileSystemLike;
+    const os = requireFn("os") as { tmpdir(): string };
+    const path = requireFn("path") as { join(...parts: string[]): string };
+    const tempPath = path.join(os.tmpdir(), `outline-markdown-export-${Date.now()}-${Math.random().toString(36).slice(2)}.html`);
+    let printWindow: ElectronPrintWindow | null = null;
+
+    try {
+      await fileSystem.promises.writeFile(tempPath, html, "utf8");
+      printWindow = new BrowserWindow({
+        show: false,
+        width: 1000,
+        height: 1200,
+        webPreferences: {
+          offscreen: true,
+          backgroundThrottling: false,
+        },
+      });
+      await printWindow.loadFile(tempPath);
+      await printWindow.webContents.executeJavaScript?.(`Promise.race([
+        Promise.all([
+          document.fonts ? document.fonts.ready : Promise.resolve(),
+          ...Array.from(document.images).map((image) => image.complete
+            ? Promise.resolve()
+            : new Promise((resolve) => {
+              image.addEventListener("load", resolve, { once: true });
+              image.addEventListener("error", resolve, { once: true });
+            })),
+        ]),
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ])`);
+      return await printWindow.webContents.printToPDF(options);
+    } finally {
+      printWindow?.destroy();
+      await fileSystem.promises.unlink(tempPath).catch(() => undefined);
     }
   }
 
