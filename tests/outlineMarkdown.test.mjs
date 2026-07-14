@@ -13,7 +13,7 @@ try {
   const pdfBundlePath = path.join(tempDir, "pdfOutline.mjs");
   const resolverBundlePath = path.join(tempDir, "outlineContextResolver.mjs");
   const queueBundlePath = path.join(tempDir, "serialTaskQueue.mjs");
-  const printWindowBundlePath = path.join(tempDir, "printWindow.mjs");
+  const nativePdfBundlePath = path.join(tempDir, "nativePdfExport.mjs");
   await build({
     entryPoints: [path.join(rootDir, "src/outlineMarkdown.ts")],
     outfile: bundlePath,
@@ -33,8 +33,8 @@ try {
     logLevel: "silent",
   });
   await build({
-    entryPoints: [path.join(rootDir, "src/printWindow.ts")],
-    outfile: printWindowBundlePath,
+    entryPoints: [path.join(rootDir, "src/nativePdfExport.ts")],
+    outfile: nativePdfBundlePath,
     bundle: true,
     platform: "node",
     format: "esm",
@@ -79,36 +79,23 @@ try {
   } = await import(pathToFileURL(bundlePath).href);
   const { resolveOutlineHeadingIdentity, resolveOutlineHeadingIdentityWithOptionalMetadata } = await import(pathToFileURL(resolverBundlePath).href);
   const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
-  const { buildPrintDocumentHtml, findAppCssResourceUrls, replaceAppCssResourceUrls } = await import(pathToFileURL(printWindowBundlePath).href);
+  const {
+    getNativeTempMarkdownPath,
+    getNativeTempPdfFileName,
+    injectPdfBookmarkMarkers,
+    mapPdfBookmarkMarkersToPages,
+    restorePdfIncludeName,
+    shouldRetryNativeTempPdfCleanup,
+    snapshotPdfIncludeName,
+    withTimeout,
+  } = await import(pathToFileURL(nativePdfBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
-  const { addPdfBookmarks, finalizeBookmarkedPdf, getPdfPrintAnchorDescriptor } = await import(pathToFileURL(pdfBundlePath).href);
-
-  assert.equal(
-    buildPrintDocumentHtml("<style>.print{display:block}</style>", "theme-dark", "<div class=\"print\">Section</div>"),
-    "<!doctype html><html><head><meta charset=\"utf-8\"><style>.print{display:block}</style><style>.outline-markdown-export-print-root{display:block!important}</style></head><body class=\"theme-dark\"><div class=\"print\">Section</div></body></html>",
-  );
-  const mathCss = [
-    '@font-face{src:url("app://obsidian.md/math/MathJax_Main.woff")}',
-    '@font-face{src:url(app://obsidian.md/math/MathJax_Size1.woff)}',
-    '@font-face{src:url("app://obsidian.md/math/MathJax_Main.woff")}',
-    '<link rel="stylesheet" href="app://obsidian.md/app.css">',
-  ].join("\n");
-  assert.deepEqual(findAppCssResourceUrls(mathCss), [
-    "app://obsidian.md/math/MathJax_Main.woff",
-    "app://obsidian.md/math/MathJax_Size1.woff",
-  ]);
-  assert.equal(
-    replaceAppCssResourceUrls(mathCss, new Map([
-      ["app://obsidian.md/math/MathJax_Main.woff", "data:font/woff;base64,MAIN"],
-      ["app://obsidian.md/math/MathJax_Size1.woff", "data:font/woff;base64,SIZE1"],
-    ])),
-    [
-      '@font-face{src:url("data:font/woff;base64,MAIN")}',
-      '@font-face{src:url(data:font/woff;base64,SIZE1)}',
-      '@font-face{src:url("data:font/woff;base64,MAIN")}',
-      '<link rel="stylesheet" href="app://obsidian.md/app.css">',
-    ].join("\n"),
-  );
+  const {
+    addPdfBookmarks,
+    finalizeBookmarkedPdf,
+    getPdfPrintAnchorDescriptor,
+    PDF_PRINT_ANCHOR_URI_PREFIX,
+  } = await import(pathToFileURL(pdfBundlePath).href);
 
   assert.equal(
     buildOutlineMarkdown(
@@ -128,6 +115,61 @@ try {
       "    - Joint distribution",
       "    - Marginal distribution",
     ].join("\n"),
+  );
+
+  assert.equal(
+    getNativeTempMarkdownPath("math/chapter.md", "171-abc"),
+    "math/outline-markdown-export-native-171-abc.md",
+  );
+  assert.equal(
+    getNativeTempMarkdownPath("chapter.md", "unsafe token/with spaces"),
+    "outline-markdown-export-native-unsafe-token-with-spaces.md",
+  );
+  assert.equal(
+    getNativeTempPdfFileName("171-abc"),
+    "outline-markdown-export-native-171-abc.pdf",
+  );
+  const includeNameSnapshot = snapshotPdfIncludeName({ includeName: true, pageSize: "A4" });
+  assert.deepEqual(
+    restorePdfIncludeName({ includeName: false, pageSize: "Letter", landscape: true }, includeNameSnapshot),
+    { includeName: true, pageSize: "Letter", landscape: true },
+  );
+  assert.deepEqual(
+    restorePdfIncludeName({ includeName: false, pageSize: "A4" }, snapshotPdfIncludeName({ pageSize: "A4" })),
+    { pageSize: "A4" },
+  );
+  const markerResult = injectPdfBookmarkMarkers(
+    "# Root ##\n\nSection\n---\n",
+    [
+      { heading: "Root", level: 1, startOffset: 0, endOffset: 10, style: "atx" },
+      { heading: "Section", level: 2, startOffset: 12, endOffset: 24, style: "setext" },
+    ],
+    "171-abc",
+  );
+  assert.deepEqual(markerResult.markers, [
+    { marker: "OMXBM171abcX0END", heading: "Root", level: 1 },
+    { marker: "OMXBM171abcX1END", heading: "Section", level: 2 },
+  ]);
+  assert.match(markerResult.markdown, /^# Root <span[^>]*>OMXBM171abcX0END<\/span> ##$/m);
+  assert.match(markerResult.markdown, /^Section <span[^>]*>OMXBM171abcX1END<\/span>$/m);
+  assert.deepEqual(
+    mapPdfBookmarkMarkersToPages(markerResult.markers, [
+      "body mentions Root before the real heading",
+      "RootOMXBM171abcX0END",
+      "SectionOMXBM171abcX1END",
+    ]),
+    [
+      { heading: "Root", level: 1, pageIndex: 1 },
+      { heading: "Section", level: 2, pageIndex: 2 },
+    ],
+  );
+  assert.equal(shouldRetryNativeTempPdfCleanup({ code: "EBUSY" }), true);
+  assert.equal(shouldRetryNativeTempPdfCleanup({ code: "EPERM" }), true);
+  assert.equal(shouldRetryNativeTempPdfCleanup({ code: "ENOENT" }), false);
+  assert.equal(shouldRetryNativeTempPdfCleanup(new Error("unknown")), false);
+  await assert.rejects(
+    withTimeout(new Promise(() => undefined), 10, "原生导出超时"),
+    /原生导出超时/,
   );
 
   assert.equal(
@@ -812,7 +854,9 @@ try {
   const bookmarkedPdfBytes = await addPdfBookmarks(sourcePdfBytes, [
     { heading: "Document", level: 1, pageIndex: 0 },
     { heading: "Section", level: 2, pageIndex: 1 },
-  ]);
+  ], { title: "Source Note" });
+  const bookmarkedPdf = await PDFDocument.load(bookmarkedPdfBytes);
+  assert.equal(bookmarkedPdf.getTitle(), "Source Note");
   const bookmarkedPdfText = Buffer.from(bookmarkedPdfBytes).toString("latin1");
   assert.match(bookmarkedPdfText, /\/Outlines/);
   assert.match(bookmarkedPdfText, /Document|0044006F00630075006D0065006E0074/);
@@ -842,7 +886,7 @@ try {
       Subtype: "Link",
       Rect: [50, top - 2, 52, top],
       Border: [0, 0, 0],
-      A: { Type: "Action", S: "URI", URI: PDFString.of(`af://${key}`) },
+      A: { Type: "Action", S: "URI", URI: PDFString.of(`${PDF_PRINT_ANCHOR_URI_PREFIX}${key}`) },
     });
     const annotationRef = anchorContext.register(annotation);
     page.node.set(PDFName.of("Annots"), anchorContext.obj([annotationRef]));
@@ -855,12 +899,13 @@ try {
     { key: "omx-0", heading: "第一章", level: 1 },
     { key: "omx-1", heading: "第一节", level: 2 },
     { key: "omx-missing", heading: "Ghost", level: 2 },
-  ]);
+  ], { title: "锚点测试" });
   assert.equal(finalized.matchedCount, 2);
   assert.equal(hasPdfOutlines(finalized.bytes), true);
+  assert.equal((await PDFDocument.load(finalized.bytes)).getTitle(), "锚点测试");
   const finalizedText = Buffer.from(finalized.bytes).toString("latin1");
   assert.match(finalizedText, /\/XYZ/);
-  assert.ok(!finalizedText.includes("af://"), "anchor annotations should be removed");
+  assert.ok(!finalizedText.includes(PDF_PRINT_ANCHOR_URI_PREFIX), "anchor annotations should be removed");
 } finally {
   await rm(tempDir, { recursive: true, force: true });
 }

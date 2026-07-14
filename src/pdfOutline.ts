@@ -43,6 +43,10 @@ export interface FinalizeBookmarkedPdfResult {
   matchedCount: number;
 }
 
+export interface AddPdfBookmarksOptions {
+  title?: string;
+}
+
 interface AnchorPosition {
   pageIndex: number;
   top?: number;
@@ -62,8 +66,13 @@ interface OutlineWriteResult {
 export async function addPdfBookmarks(
   pdfData: ArrayBuffer | Uint8Array,
   targets: PdfBookmarkTarget[],
+  options: AddPdfBookmarksOptions = {},
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(pdfData);
+  const title = options.title?.trim();
+  if (title) {
+    pdfDoc.setTitle(title);
+  }
   writePdfBookmarks(pdfDoc, targets);
   return pdfDoc.save({ useObjectStreams: false });
 }
@@ -71,8 +80,13 @@ export async function addPdfBookmarks(
 export async function finalizeBookmarkedPdf(
   pdfData: ArrayBuffer | Uint8Array,
   anchors: PdfAnchorTarget[],
+  options: AddPdfBookmarksOptions = {},
 ): Promise<FinalizeBookmarkedPdfResult> {
   const pdfDoc = await PDFDocument.load(pdfData);
+  const title = options.title?.trim();
+  if (title) {
+    pdfDoc.setTitle(title);
+  }
   const positions = collectAndRemoveAnchorAnnotations(pdfDoc);
 
   const targets: PdfBookmarkTarget[] = [];
