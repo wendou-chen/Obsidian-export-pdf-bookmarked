@@ -42,13 +42,13 @@ import {
 } from "./pdfOutline";
 import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
 import { SerialTaskQueue } from "./serialTaskQueue";
-import { buildPrintDocumentHtml } from "./printWindow";
+import { buildPrintDocumentHtml, findAppCssResourceUrls, replaceAppCssResourceUrls } from "./printWindow";
 
 type CurrentFileAction = "copy" | "export" | "bookmarked-pdf" | "pdf";
 
 interface PrintToPdfWebContents {
   printToPDF(options: Record<string, unknown>): Promise<ArrayBuffer | Uint8Array>;
-  executeJavaScript?(code: string): Promise<unknown>;
+  executeJavaScript(code: string): Promise<unknown>;
 }
 
 interface ElectronPrintWindow {
@@ -87,6 +87,7 @@ const PDF_PRINT_OPTIONS: Record<string, unknown> = {
 
 export default class OutlineMarkdownExportPlugin extends Plugin {
   private readonly pdfPrintQueue = new SerialTaskQueue();
+  private readonly printResourceDataUrls = new Map<string, Promise<string>>();
   async onload(): Promise<void> {
     this.addCommand({
       id: "copy-current-outline-markdown",
@@ -430,9 +431,10 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       await this.waitForRenderToSettle(content);
 
       const wrapperHtml = await this.clonePrintWrapperWithInlineImages(wrapper);
-      const headHtml = Array.from(document.head.querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
+      const rawHeadHtml = Array.from(document.head.querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
         'link[rel="stylesheet"], style',
       )).map((element) => element.outerHTML).join("\n");
+      const headHtml = await this.inlinePrintHeadResources(rawHeadHtml);
       const html = buildPrintDocumentHtml(headHtml, document.body.className, wrapperHtml);
       const pdfData = await this.printHtmlInHiddenWindow(html, PDF_PRINT_OPTIONS);
       const pdfBytes = pdfData instanceof Uint8Array ? pdfData : new Uint8Array(pdfData);
@@ -584,24 +586,54 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       }
 
       try {
-        const response = await fetch(source);
-        if (!response.ok) {
-          return;
-        }
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        let binary = "";
-        const chunkSize = 0x8000;
-        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-          binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-        }
-        const mimeType = response.headers.get("content-type") || "image/png";
-        clonedImage.src = `data:${mimeType};base64,${btoa(binary)}`;
+        clonedImage.src = await this.fetchResourceDataUrl(source, "image/png");
       } catch (error) {
+        if (source.startsWith("app://obsidian.md/")) {
+          throw new Error(`?????????${source}`);
+        }
         console.warn("Failed to inline print image", source, error);
       }
     }));
 
     return clone.outerHTML;
+  }
+
+  private async inlinePrintHeadResources(headHtml: string): Promise<string> {
+    const urls = findAppCssResourceUrls(headHtml);
+    const replacements = new Map<string, string>();
+    await Promise.all(urls.map(async (url) => {
+      replacements.set(url, await this.getCachedPrintResourceDataUrl(url));
+    }));
+    return replaceAppCssResourceUrls(headHtml, replacements);
+  }
+
+  private getCachedPrintResourceDataUrl(url: string): Promise<string> {
+    const existing = this.printResourceDataUrls.get(url);
+    if (existing) {
+      return existing;
+    }
+
+    const pending = this.fetchResourceDataUrl(url, "application/octet-stream").catch((error) => {
+      this.printResourceDataUrls.delete(url);
+      throw error;
+    });
+    this.printResourceDataUrls.set(url, pending);
+    return pending;
+  }
+
+  private async fetchResourceDataUrl(url: string, fallbackMimeType: string): Promise<string> {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`?????????${response.status}??${url}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    const mimeType = response.headers.get("content-type") || fallbackMimeType;
+    return `data:${mimeType};base64,${btoa(binary)}`;
   }
 
   private async printHtmlInHiddenWindow(
@@ -633,18 +665,34 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         },
       });
       await printWindow.loadFile(tempPath);
-      await printWindow.webContents.executeJavaScript?.(`Promise.race([
-        Promise.all([
-          document.fonts ? document.fonts.ready : Promise.resolve(),
-          ...Array.from(document.images).map((image) => image.complete
-            ? Promise.resolve()
-            : new Promise((resolve) => {
-              image.addEventListener("load", resolve, { once: true });
-              image.addEventListener("error", resolve, { once: true });
-            })),
-        ]),
-        new Promise((resolve) => setTimeout(resolve, 3000)),
-      ])`);
+      const resourceState = await printWindow.webContents.executeJavaScript(`(async () => {
+        await Promise.race([
+          Promise.all([
+            document.fonts ? document.fonts.ready : Promise.resolve(),
+            ...Array.from(document.images).map((image) => image.complete
+              ? Promise.resolve()
+              : new Promise((resolve) => {
+                image.addEventListener("load", resolve, { once: true });
+                image.addEventListener("error", resolve, { once: true });
+              })),
+          ]),
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+        const hasMath = document.querySelector("mjx-container") !== null;
+        const mathFontErrors = document.fonts
+          ? Array.from(document.fonts)
+            .filter((font) => font.family.startsWith("MJX") && font.status === "error")
+            .map((font) => font.family)
+          : [];
+        return {
+          hasMath,
+          mathFontReady: !hasMath || document.fonts.check("16px MJXTEX"),
+          mathFontErrors,
+        };
+      })()` ) as { hasMath?: boolean; mathFontReady?: boolean; mathFontErrors?: string[] };
+      if (resourceState.hasMath && (!resourceState.mathFontReady || (resourceState.mathFontErrors?.length ?? 0) > 0)) {
+        throw new Error(`????????????????${resourceState.mathFontErrors?.join(", ") || "MJXTEX"}`);
+      }
       return await printWindow.webContents.printToPDF(options);
     } finally {
       printWindow?.destroy();

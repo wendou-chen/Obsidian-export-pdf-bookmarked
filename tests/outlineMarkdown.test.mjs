@@ -79,13 +79,35 @@ try {
   } = await import(pathToFileURL(bundlePath).href);
   const { resolveOutlineHeadingIdentity, resolveOutlineHeadingIdentityWithOptionalMetadata } = await import(pathToFileURL(resolverBundlePath).href);
   const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
-  const { buildPrintDocumentHtml } = await import(pathToFileURL(printWindowBundlePath).href);
+  const { buildPrintDocumentHtml, findAppCssResourceUrls, replaceAppCssResourceUrls } = await import(pathToFileURL(printWindowBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const { addPdfBookmarks, finalizeBookmarkedPdf, getPdfPrintAnchorDescriptor } = await import(pathToFileURL(pdfBundlePath).href);
 
   assert.equal(
     buildPrintDocumentHtml("<style>.print{display:block}</style>", "theme-dark", "<div class=\"print\">Section</div>"),
-    "<!doctype html><html><head><meta charset=\"utf-8\"><style>.print{display:block}</style></head><body class=\"theme-dark\"><div class=\"print\">Section</div></body></html>",
+    "<!doctype html><html><head><meta charset=\"utf-8\"><style>.print{display:block}</style><style>.outline-markdown-export-print-root{display:block!important}</style></head><body class=\"theme-dark\"><div class=\"print\">Section</div></body></html>",
+  );
+  const mathCss = [
+    '@font-face{src:url("app://obsidian.md/math/MathJax_Main.woff")}',
+    '@font-face{src:url(app://obsidian.md/math/MathJax_Size1.woff)}',
+    '@font-face{src:url("app://obsidian.md/math/MathJax_Main.woff")}',
+    '<link rel="stylesheet" href="app://obsidian.md/app.css">',
+  ].join("\n");
+  assert.deepEqual(findAppCssResourceUrls(mathCss), [
+    "app://obsidian.md/math/MathJax_Main.woff",
+    "app://obsidian.md/math/MathJax_Size1.woff",
+  ]);
+  assert.equal(
+    replaceAppCssResourceUrls(mathCss, new Map([
+      ["app://obsidian.md/math/MathJax_Main.woff", "data:font/woff;base64,MAIN"],
+      ["app://obsidian.md/math/MathJax_Size1.woff", "data:font/woff;base64,SIZE1"],
+    ])),
+    [
+      '@font-face{src:url("data:font/woff;base64,MAIN")}',
+      '@font-face{src:url(data:font/woff;base64,SIZE1)}',
+      '@font-face{src:url("data:font/woff;base64,MAIN")}',
+      '<link rel="stylesheet" href="app://obsidian.md/app.css">',
+    ].join("\n"),
   );
 
   assert.equal(
