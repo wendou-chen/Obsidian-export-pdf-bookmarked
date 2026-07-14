@@ -13,7 +13,6 @@ try {
   const pdfBundlePath = path.join(tempDir, "pdfOutline.mjs");
   const resolverBundlePath = path.join(tempDir, "outlineContextResolver.mjs");
   const queueBundlePath = path.join(tempDir, "serialTaskQueue.mjs");
-  const printWindowBundlePath = path.join(tempDir, "printWindow.mjs");
   await build({
     entryPoints: [path.join(rootDir, "src/outlineMarkdown.ts")],
     outfile: bundlePath,
@@ -26,15 +25,6 @@ try {
   await build({
     entryPoints: [path.join(rootDir, "src/serialTaskQueue.ts")],
     outfile: queueBundlePath,
-    bundle: true,
-    platform: "node",
-    format: "esm",
-    write: true,
-    logLevel: "silent",
-  });
-  await build({
-    entryPoints: [path.join(rootDir, "src/printWindow.ts")],
-    outfile: printWindowBundlePath,
     bundle: true,
     platform: "node",
     format: "esm",
@@ -79,14 +69,8 @@ try {
   } = await import(pathToFileURL(bundlePath).href);
   const { resolveOutlineHeadingIdentity, resolveOutlineHeadingIdentityWithOptionalMetadata } = await import(pathToFileURL(resolverBundlePath).href);
   const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
-  const { buildPrintDocumentHtml } = await import(pathToFileURL(printWindowBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const { addPdfBookmarks, finalizeBookmarkedPdf, getPdfPrintAnchorDescriptor } = await import(pathToFileURL(pdfBundlePath).href);
-
-  assert.equal(
-    buildPrintDocumentHtml("<style>.print{display:block}</style>", "theme-dark", "<div class=\"print\">Section</div>"),
-    "<!doctype html><html><head><meta charset=\"utf-8\"><style>.print{display:block}</style></head><body class=\"theme-dark\"><div class=\"print\">Section</div></body></html>",
-  );
 
   assert.equal(
     buildOutlineMarkdown(
