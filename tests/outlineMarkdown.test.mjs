@@ -80,10 +80,13 @@ try {
   const { resolveOutlineHeadingIdentity, resolveOutlineHeadingIdentityWithOptionalMetadata } = await import(pathToFileURL(resolverBundlePath).href);
   const { SerialTaskQueue } = await import(pathToFileURL(queueBundlePath).href);
   const {
+    formatBookmarkedExportSuccessNotice,
     getNativeTempMarkdownPath,
     getNativeTempPdfFileName,
     injectPdfBookmarkMarkers,
+    isCompleteBookmarkMatch,
     mapPdfBookmarkMarkersToPages,
+    normalizePdfMarkerSearchText,
     restorePdfIncludeName,
     shouldRetryNativeTempPdfCleanup,
     snapshotPdfIncludeName,
@@ -92,6 +95,7 @@ try {
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const {
     addPdfBookmarks,
+    assertCatalogHasOutlines,
     finalizeBookmarkedPdf,
     getPdfPrintAnchorDescriptor,
     PDF_PRINT_ANCHOR_URI_PREFIX,
@@ -162,6 +166,68 @@ try {
       { heading: "Root", level: 1, pageIndex: 1 },
       { heading: "Section", level: 2, pageIndex: 2 },
     ],
+  );
+  // PDF.js may insert whitespace between marker characters.
+  assert.equal(normalizePdfMarkerSearchText("OMX BM\n171 abc X 0 END"), "OMXBM171abcX0END");
+  assert.deepEqual(
+    mapPdfBookmarkMarkersToPages(markerResult.markers, [
+      "body has Root text only",
+      "Root O M X B M 1 7 1 a b c X 0 E N D more",
+      "SectionOMXBM171abcX1END",
+    ]),
+    [
+      { heading: "Root", level: 1, pageIndex: 1 },
+      { heading: "Section", level: 2, pageIndex: 2 },
+    ],
+  );
+  // Unique markers must not attach to earlier body text that only mentions the heading words.
+  assert.deepEqual(
+    mapPdfBookmarkMarkersToPages(
+      [
+        { marker: "OMXBMtokX0END", heading: "例题", level: 2 },
+        { marker: "OMXBMtokX1END", heading: "例题", level: 2 },
+      ],
+      [
+        "正文先出现例题两次 例题 例题",
+        "真正标题一 OMXBMtokX0END",
+        "真正标题二 OMXBMtokX1END",
+      ],
+    ),
+    [
+      { heading: "例题", level: 2, pageIndex: 1 },
+      { heading: "例题", level: 2, pageIndex: 2 },
+    ],
+  );
+  // Missing middle marker stops the sequence; callers must hard-fail on partial match.
+  const partialMarkerMatch = mapPdfBookmarkMarkersToPages(
+    [
+      { marker: "OMXBMaX0END", heading: "A", level: 1 },
+      { marker: "OMXBMaX1END", heading: "B", level: 2 },
+      { marker: "OMXBMaX2END", heading: "C", level: 2 },
+    ],
+    [
+      "AOMXBMaX0END",
+      "C only later OMXBMaX2END",
+    ],
+  );
+  assert.deepEqual(partialMarkerMatch, [
+    { heading: "A", level: 1, pageIndex: 0 },
+  ]);
+  assert.equal(isCompleteBookmarkMatch(partialMarkerMatch.length, 3), false);
+  assert.equal(isCompleteBookmarkMatch(11, 11), true);
+  assert.equal(isCompleteBookmarkMatch(0, 0), false);
+  assert.equal(isCompleteBookmarkMatch(0, 5), false);
+  assert.match(
+    formatBookmarkedExportSuccessNotice("section", 11, 11, "note--19.bookmarked.pdf"),
+    /^已导出此节带书签 PDF（11\/11）：note--19\.bookmarked\.pdf/,
+  );
+  assert.match(
+    formatBookmarkedExportSuccessNotice("note", 193, 193, "note.bookmarked.pdf"),
+    /^已导出带书签 PDF（193\/193）：note\.bookmarked\.pdf/,
+  );
+  assert.match(
+    formatBookmarkedExportSuccessNotice("section", 10, 10, "x.bookmarked.pdf"),
+    /Edge\/Sumatra\/Adobe/,
   );
   assert.equal(shouldRetryNativeTempPdfCleanup({ code: "EBUSY" }), true);
   assert.equal(shouldRetryNativeTempPdfCleanup({ code: "EPERM" }), true);
@@ -851,12 +917,15 @@ try {
   sourcePdf.addPage();
   sourcePdf.addPage();
   const sourcePdfBytes = await sourcePdf.save({ useObjectStreams: false });
-  const bookmarkedPdfBytes = await addPdfBookmarks(sourcePdfBytes, [
+  const bookmarkedPdfResult = await addPdfBookmarks(sourcePdfBytes, [
     { heading: "Document", level: 1, pageIndex: 0 },
     { heading: "Section", level: 2, pageIndex: 1 },
   ], { title: "Source Note" });
-  const bookmarkedPdf = await PDFDocument.load(bookmarkedPdfBytes);
+  assert.equal(bookmarkedPdfResult.writtenCount, 2);
+  await assertCatalogHasOutlines(bookmarkedPdfResult.bytes, 2);
+  const bookmarkedPdf = await PDFDocument.load(bookmarkedPdfResult.bytes);
   assert.equal(bookmarkedPdf.getTitle(), "Source Note");
+  const bookmarkedPdfBytes = bookmarkedPdfResult.bytes;
   const bookmarkedPdfText = Buffer.from(bookmarkedPdfBytes).toString("latin1");
   assert.match(bookmarkedPdfText, /\/Outlines/);
   assert.match(bookmarkedPdfText, /Document|0044006F00630075006D0065006E0074/);
@@ -867,11 +936,13 @@ try {
   const levelZeroPdf = await PDFDocument.create();
   levelZeroPdf.addPage();
   levelZeroPdf.addPage();
-  const levelZeroBytes = await addPdfBookmarks(await levelZeroPdf.save({ useObjectStreams: false }), [
+  const levelZeroResult = await addPdfBookmarks(await levelZeroPdf.save({ useObjectStreams: false }), [
     { heading: "Root", level: 0, pageIndex: 0 },
     { heading: "Selected H1", level: 1, pageIndex: 1 },
   ]);
-  assert.equal(hasPdfOutlines(levelZeroBytes), true);
+  assert.equal(levelZeroResult.writtenCount, 2);
+  assert.equal(hasPdfOutlines(levelZeroResult.bytes), true);
+  const levelZeroBytes = levelZeroResult.bytes;
   const levelZeroText = Buffer.from(levelZeroBytes).toString("latin1");
   assert.match(levelZeroText, /Root|0052006F006F0074/);
   assert.match(levelZeroText, /Selected H1|00530065006C00650063007400650064002000480031/);

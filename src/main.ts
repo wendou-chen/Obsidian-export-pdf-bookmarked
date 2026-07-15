@@ -1,5 +1,6 @@
 import {
   App,
+  FileSystemAdapter,
   FuzzySuggestModal,
   MarkdownView,
   Notice,
@@ -33,11 +34,14 @@ import {
 } from "./outlineMarkdown";
 import {
   addPdfBookmarks,
+  assertCatalogHasOutlines,
 } from "./pdfOutline";
 import {
+  formatBookmarkedExportSuccessNotice,
   getNativeTempMarkdownPath,
   getNativeTempPdfFileName,
   injectPdfBookmarkMarkers,
+  isCompleteBookmarkMatch,
   mapPdfBookmarkMarkersToPages,
   restorePdfIncludeName,
   shouldRetryNativeTempPdfCleanup,
@@ -122,7 +126,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
 
       this.addCommand({
         id: "add-bookmarks-to-native-pdf",
-        name: "给已有 PDF 注入书签",
+        name: "给已有 PDF 注入书签（尽力匹配，非一键导出）",
         checkCallback: (checking) => this.handleCurrentFileCommand(checking, "pdf"),
       });
     }
@@ -291,11 +295,18 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         prepared.markers,
         path,
       );
-      if (bookmarkResult.matchedCount > 0) {
-        new Notice(`已导出此节带书签 PDF（${bookmarkResult.matchedCount} 个书签）：${path}`);
-      } else {
-        throw new Error("未生成任何 PDF 书签");
+      if (!isCompleteBookmarkMatch(bookmarkResult.matchedCount, bookmarkResult.expectedCount)) {
+        throw new Error(
+          `PDF 书签匹配不完整（${bookmarkResult.matchedCount}/${bookmarkResult.expectedCount}），未写入最终文件`,
+        );
       }
+      new Notice(formatBookmarkedExportSuccessNotice(
+        "section",
+        bookmarkResult.matchedCount,
+        bookmarkResult.expectedCount,
+        path,
+      ), 12000);
+      this.openExportedPdfExternally(path);
     } catch (error) {
       console.error("Failed to export outline section PDF", error);
       new Notice(`导出此节带书签 PDF 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -421,11 +432,18 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         outputPath,
       );
 
-      if (bookmarkResult.matchedCount > 0) {
-        new Notice(`已导出带书签 PDF（${bookmarkResult.matchedCount} 个书签）：${outputPath}`);
-      } else {
-        throw new Error("未生成任何 PDF 书签");
+      if (!isCompleteBookmarkMatch(bookmarkResult.matchedCount, bookmarkResult.expectedCount)) {
+        throw new Error(
+          `PDF 书签匹配不完整（${bookmarkResult.matchedCount}/${bookmarkResult.expectedCount}），未写入最终文件`,
+        );
       }
+      new Notice(formatBookmarkedExportSuccessNotice(
+        "note",
+        bookmarkResult.matchedCount,
+        bookmarkResult.expectedCount,
+        outputPath,
+      ), 12000);
+      this.openExportedPdfExternally(outputPath);
     } catch (error) {
       console.error("Failed to export bookmarked PDF", error);
       const message = error instanceof Error ? error.message : String(error);
@@ -439,7 +457,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     bookmarkMarkdown: string,
     markers: PdfBookmarkMarker[],
     outputPath: string,
-  ): Promise<{ matchedCount: number }> {
+  ): Promise<{ matchedCount: number; expectedCount: number }> {
     return this.pdfExportQueue.run(async () => {
       this.assertPluginLoaded();
       const nativePdfBytes = await this.exportMarkdownWithObsidianNativePdfSerial(file, printableMarkdown);
@@ -798,9 +816,11 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     const headings = getPdfBookmarkHeadings(parseMarkdownHeadings(markdown));
     const targets = mapPdfBookmarkMarkersToPages(markers, pageTexts);
     const title = headings.find((heading) => heading.level === 1)?.heading;
+    // Success is defined by outline nodes actually written, not just mapped targets.
+    const written = await addPdfBookmarks(pdfBytes, targets, { title });
     return {
-      bytes: await addPdfBookmarks(pdfBytes, targets, { title }),
-      matchedCount: targets.length,
+      bytes: written.bytes,
+      matchedCount: written.writtenCount,
       expectedCount: markers.length,
     };
   }
@@ -820,21 +840,82 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     nativePdfBytes: Uint8Array,
     markdown: string,
     markers: PdfBookmarkMarker[],
-  ): Promise<{ matchedCount: number }> {
+  ): Promise<{ matchedCount: number; expectedCount: number }> {
     this.assertPluginLoaded();
     if (markers.length === 0) {
       throw new Error("当前内容没有可写入 PDF 的标题，未生成最终文件");
     }
     const finalized = await this.addBookmarksToRenderedPdf(nativePdfBytes.slice(), markdown, markers);
-    if (finalized.matchedCount !== finalized.expectedCount) {
+    if (!isCompleteBookmarkMatch(finalized.matchedCount, finalized.expectedCount)) {
       throw new Error(
         `PDF 书签匹配不完整（${finalized.matchedCount}/${finalized.expectedCount}），未写入最终文件`,
       );
     }
+    // Catalog-level proof before vault write: never claim success without a real outline tree.
+    await assertCatalogHasOutlines(finalized.bytes, finalized.matchedCount);
 
     this.assertPluginLoaded();
     await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(finalized.bytes));
-    return { matchedCount: finalized.matchedCount };
+    return {
+      matchedCount: finalized.matchedCount,
+      expectedCount: finalized.expectedCount,
+    };
+  }
+
+  /** Open with the OS default PDF app so native outlines are visible (Obsidian viewer often hides them). */
+  private openExportedPdfExternally(vaultRelativePath: string): void {
+    try {
+      const adapter = this.app.vault.adapter;
+      if (!(adapter instanceof FileSystemAdapter)) {
+        new Notice(
+          `PDF 已写入：${vaultRelativePath}。请用 Edge/Sumatra/Adobe 打开左侧书签（Obsidian 内置 PDF 可能不显示）`,
+          12000,
+        );
+        return;
+      }
+      const absolutePath = adapter.getFullPath(vaultRelativePath);
+      const requireFn = (window as WindowWithRequire).require?.bind(window);
+      if (!requireFn) {
+        new Notice(
+          `PDF 已写入：${vaultRelativePath}。请手动用外部阅读器打开查看书签`,
+          12000,
+        );
+        return;
+      }
+      const electron = requireFn("electron") as {
+        shell?: { openPath?: (path: string) => Promise<string> };
+      } | null;
+      const openPath = electron?.shell?.openPath;
+      if (typeof openPath === "function") {
+        void openPath(absolutePath).then((errorMessage) => {
+          if (errorMessage) {
+            console.warn("Failed to open exported PDF externally", absolutePath, errorMessage);
+            new Notice(
+              `PDF 已写入，但无法自动打开外部阅读器：${absolutePath}。请手动用 Edge/Sumatra 打开左侧书签`,
+              12000,
+            );
+          }
+        });
+        return;
+      }
+      const childProcess = requireFn("child_process") as {
+        execFile?: (file: string, args: string[]) => void;
+      };
+      if (Platform.isWin && typeof childProcess.execFile === "function") {
+        childProcess.execFile("cmd", ["/c", "start", "", absolutePath]);
+        return;
+      }
+      new Notice(
+        `PDF 已写入：${absolutePath}。请手动用外部阅读器打开查看书签`,
+        12000,
+      );
+    } catch (error) {
+      console.warn("Failed to open exported PDF externally", error);
+      new Notice(
+        `PDF 已写入：${vaultRelativePath}。自动打开失败，请手动用 Edge/Sumatra/Adobe 打开左侧书签`,
+        12000,
+      );
+    }
   }
 
   private delay(milliseconds: number): Promise<void> {
@@ -870,20 +951,24 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       const inputPdfBytes = await this.app.vault.readBinary(pdfFile);
       const pageTexts = await this.extractPdfPageTexts(inputPdfBytes);
       const targets = this.buildBookmarkTargets(markdownFile, markdownHeadings, pageTexts);
+      const expectedCount = bookmarkHeadings.length
+        + (needsSyntheticPdfRootHeading(markdownHeadings) ? 1 : 0);
       if (targets.length === 0) {
-        new Notice("没有在 PDF 中匹配到 Markdown 标题，请确认选择的是该笔记的原生导出 PDF");
+        new Notice("没有在 PDF 中匹配到 Markdown 标题，请确认选择的是该笔记的原生导出 PDF（此命令为尽力匹配，推荐改用「导出带书签 PDF」）");
         return;
       }
 
-      const outputBytes = await addPdfBookmarks(inputPdfBytes, targets);
+      const written = await addPdfBookmarks(inputPdfBytes, targets);
       const outputPath = normalizePath(getBookmarkedPdfExportPath(pdfFile.path));
-      await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(outputBytes));
+      await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(written.bytes));
 
-      new Notice(`已添加 ${targets.length} 个 PDF 书签：${outputPath}`);
+      new Notice(
+        `已尽力为已有 PDF 写入 ${written.writtenCount}/${Math.max(expectedCount, targets.length)} 个书签（非一键导出链路，页码可能不准）：${outputPath}`,
+      );
     } catch (error) {
       console.error("Failed to add PDF bookmarks", error);
       const message = error instanceof Error ? error.message : String(error);
-      new Notice(`添加 PDF 书签失败：${message}`);
+      new Notice(`给已有 PDF 注入书签失败：${message}`);
     }
   }
 

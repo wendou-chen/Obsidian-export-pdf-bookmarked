@@ -106,21 +106,38 @@ export function injectPdfBookmarkMarkers(
   return { markdown: output, markers };
 }
 
+/**
+ * PDF.js may insert whitespace between characters of the invisible marker.
+ * Match only on the unique OMXBM token after stripping all whitespace.
+ */
+export function normalizePdfMarkerSearchText(text: string): string {
+  return text.replace(/\s+/g, "");
+}
+
 export function mapPdfBookmarkMarkersToPages(
   markers: PdfBookmarkMarker[],
   pageTexts: string[],
 ): PdfBookmarkMarkerTarget[] {
+  const normalizedPages = pageTexts.map((text) => normalizePdfMarkerSearchText(text));
   const targets: PdfBookmarkMarkerTarget[] = [];
   let cursorPage = 0;
   for (const marker of markers) {
+    const normalizedMarker = normalizePdfMarkerSearchText(marker.marker);
+    if (!normalizedMarker) {
+      continue;
+    }
     let matchedPage = -1;
-    for (let pageIndex = cursorPage; pageIndex < pageTexts.length; pageIndex += 1) {
-      if (pageTexts[pageIndex].includes(marker.marker)) {
+    for (let pageIndex = cursorPage; pageIndex < normalizedPages.length; pageIndex += 1) {
+      if (normalizedPages[pageIndex].includes(normalizedMarker)) {
         matchedPage = pageIndex;
         break;
       }
     }
-    if (matchedPage < 0) continue;
+    if (matchedPage < 0) {
+      // Keep reading order: a missing marker must not let later markers
+      // silently attach to an earlier page's leftover text.
+      break;
+    }
     targets.push({
       heading: marker.heading,
       level: marker.level,
@@ -129,6 +146,69 @@ export function mapPdfBookmarkMarkersToPages(
     cursorPage = matchedPage;
   }
   return targets;
+}
+
+/** Pure contract helper: one-shot bookmarked export only succeeds on full match. */
+export function isCompleteBookmarkMatch(matchedCount: number, expectedCount: number): boolean {
+  return expectedCount > 0 && matchedCount === expectedCount;
+}
+
+export function formatBookmarkedExportSuccessNotice(
+  kind: "note" | "section",
+  matchedCount: number,
+  expectedCount: number,
+  outputPath: string,
+): string {
+  const label = kind === "section" ? "此节带书签 PDF" : "带书签 PDF";
+  return (
+    `已导出${label}（${matchedCount}/${expectedCount}）：${outputPath}`
+    + "。请用 Edge/Sumatra/Adobe 打开左侧书签；Obsidian 内置 PDF 可能不显示大纲"
+  );
+}
+
+/** Byte-level proof that pdf-lib actually attached an outline dictionary. */
+export function assertPdfBytesHaveOutlines(pdfBytes: Uint8Array, matchedCount: number): void {
+  if (matchedCount <= 0) {
+    throw new Error("书签数量为 0，未写入最终文件");
+  }
+  // Avoid importing outlineMarkdown here (native helpers stay dependency-light).
+  const marker = "/Outlines";
+  let found = false;
+  for (let index = 0; index <= pdfBytes.length - marker.length; index += 1) {
+    let matched = true;
+    for (let markerIndex = 0; markerIndex < marker.length; markerIndex += 1) {
+      if (pdfBytes[index + markerIndex] !== marker.charCodeAt(markerIndex)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    throw new Error("PDF 字节中未检测到 /Outlines，书签写入失败，未写入最终文件");
+  }
+  if (!pdfBytesIncludes(pdfBytes, "/UseOutlines")) {
+    throw new Error("PDF 字节中未检测到 /UseOutlines，书签目录模式写入失败，未写入最终文件");
+  }
+}
+
+function pdfBytesIncludes(pdfBytes: Uint8Array, needle: string): boolean {
+  for (let index = 0; index <= pdfBytes.length - needle.length; index += 1) {
+    let matched = true;
+    for (let needleIndex = 0; needleIndex < needle.length; needleIndex += 1) {
+      if (pdfBytes[index + needleIndex] !== needle.charCodeAt(needleIndex)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function shouldRetryNativeTempPdfCleanup(error: unknown): boolean {

@@ -57,8 +57,8 @@ A section PDF adds the source note's basename as a synthetic H1, which becomes b
 | --- | --- |
 | Copy current file outline as Markdown | Copies the note heading tree to the clipboard. |
 | Export current file outline as Markdown | Writes a `*.outline.md` file beside the source note. |
-| Export bookmarked PDF | Prints the current note to `*.bookmarked.pdf` and injects native PDF bookmarks. |
-| Add bookmarks to existing PDF | Finds a matching PDF and adds bookmarks based on the source Markdown headings. |
+| Export bookmarked PDF | **Primary path**: native print + unique marker page mapping + outline write in one shot. Success notices show `matched/expected`; any incomplete match fails without writing the final file. |
+| Add bookmarks to existing PDF (best-effort, not one-shot export) | **Secondary path**: best-effort text matching against an existing native PDF. Partial matches and wrong pages are possible; prefer one-shot export. |
 
 PDF commands depend on Electron PDF export APIs and therefore require the Obsidian desktop app. Copying or exporting a section as Markdown remains available on mobile.
 
@@ -106,9 +106,12 @@ The test suite checks outline and section parsing, export paths, duplicate-headi
 ## Limitations
 
 - PDF export commands and bookmarked section PDF export require Obsidian desktop.
-- Bookmarks are generated from Markdown headings.
-- Adding bookmarks to an already exported PDF depends on matching heading text to PDF page text, so scanned/image-only PDFs may not map well.
-- The default PDF bookmark filter targets the top heading levels to keep exported outlines readable.
+- Bookmarks come from Markdown headings and default to **H1–H3** only.
+- **One-shot export contract**: the final `*.bookmarked.pdf` is written only when every expected bookmark marker matches; incomplete matches fail hard and do not leave a bookmark-less "bookmarked" file.
+- Output lands next to the source note (`*.bookmarked.pdf` or `source--heading.bookmarked.pdf`), not on the desktop or in a temp folder.
+- Prefer external readers (Edge / SumatraPDF / Adobe) for the outline sidebar; Obsidian's built-in PDF view may not show `/Outlines`.
+- Temporary UI freezes during export come from Obsidian's native `printToPdf` layout, not from the bookmark writer itself.
+- "Add bookmarks to existing PDF" is best-effort text matching and can mis-page on repeated heading words; prefer one-shot export.
 - Section context menus depend on a runtime-validated private structure in Obsidian's core Outline view. If it becomes incompatible, the feature fails closed instead of guessing a heading.
 
 ## GitHub Repository Metadata

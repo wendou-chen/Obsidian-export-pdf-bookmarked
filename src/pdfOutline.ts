@@ -43,6 +43,12 @@ export interface FinalizeBookmarkedPdfResult {
   matchedCount: number;
 }
 
+export interface AddPdfBookmarksResult {
+  bytes: Uint8Array;
+  /** Outline nodes actually written into the PDF catalog (not just mapped targets). */
+  writtenCount: number;
+}
+
 export interface AddPdfBookmarksOptions {
   title?: string;
 }
@@ -67,14 +73,71 @@ export async function addPdfBookmarks(
   pdfData: ArrayBuffer | Uint8Array,
   targets: PdfBookmarkTarget[],
   options: AddPdfBookmarksOptions = {},
-): Promise<Uint8Array> {
+): Promise<AddPdfBookmarksResult> {
   const pdfDoc = await PDFDocument.load(pdfData);
   const title = options.title?.trim();
   if (title) {
     pdfDoc.setTitle(title);
   }
-  writePdfBookmarks(pdfDoc, targets);
-  return pdfDoc.save({ useObjectStreams: false });
+  const writtenCount = writePdfBookmarks(pdfDoc, targets);
+  const bytes = await pdfDoc.save({ useObjectStreams: false });
+  await assertCatalogHasOutlines(bytes, writtenCount);
+  return { bytes, writtenCount };
+}
+
+/** Catalog-level proof after save: Outlines exists, has First, Count > 0. */
+export async function assertCatalogHasOutlines(
+  pdfBytes: Uint8Array,
+  expectedWrittenCount: number,
+): Promise<void> {
+  if (expectedWrittenCount <= 0) {
+    throw new Error("书签写入数量为 0，未生成有效大纲");
+  }
+  const pdfDoc = await PDFDocument.load(pdfBytes);
+  const outlinesRef = pdfDoc.catalog.get(PDFName.of("Outlines"));
+  if (!outlinesRef) {
+    throw new Error("PDF catalog 未挂载 /Outlines，书签写入失败");
+  }
+  const outlinesDict = outlinesRef instanceof PDFRef
+    ? pdfDoc.context.lookup(outlinesRef, PDFDict)
+    : outlinesRef instanceof PDFDict
+      ? outlinesRef
+      : null;
+  if (!outlinesDict) {
+    throw new Error("PDF /Outlines 不是有效字典，书签写入失败");
+  }
+  if (!outlinesDict.get(PDFName.of("First"))) {
+    throw new Error("PDF /Outlines 缺少 /First，书签树为空");
+  }
+  const countObj = outlinesDict.get(PDFName.of("Count"));
+  const count = countObj instanceof PDFNumber
+    ? countObj.asNumber()
+    : countObj instanceof PDFRef
+      ? (() => {
+        const resolved = pdfDoc.context.lookup(countObj);
+        return resolved instanceof PDFNumber ? resolved.asNumber() : 0;
+      })()
+      : 0;
+  if (!(count > 0)) {
+    throw new Error("PDF /Outlines /Count 无效，书签树为空");
+  }
+  if (count !== expectedWrittenCount) {
+    throw new Error(
+      `PDF 书签写入数不一致（catalog Count=${count}, written=${expectedWrittenCount}）`,
+    );
+  }
+  const pageMode = pdfDoc.catalog.get(PDFName.of("PageMode"));
+  const pageModeName = pageMode instanceof PDFName
+    ? pageMode.asString()
+    : pageMode instanceof PDFRef
+      ? (() => {
+        const resolved = pdfDoc.context.lookup(pageMode);
+        return resolved instanceof PDFName ? resolved.asString() : "";
+      })()
+      : "";
+  if (pageModeName !== "/UseOutlines" && pageModeName !== "UseOutlines") {
+    throw new Error("PDF 未设置 /PageMode /UseOutlines");
+  }
 }
 
 export async function finalizeBookmarkedPdf(
@@ -111,7 +174,7 @@ export async function finalizeBookmarkedPdf(
   };
 }
 
-function writePdfBookmarks(pdfDoc: PDFDocument, targets: PdfBookmarkTarget[]): void {
+function writePdfBookmarks(pdfDoc: PDFDocument, targets: PdfBookmarkTarget[]): number {
   const pages = pdfDoc.getPages();
   const validTargets = targets.filter((target) => (
     Number.isInteger(target.pageIndex)
@@ -121,7 +184,7 @@ function writePdfBookmarks(pdfDoc: PDFDocument, targets: PdfBookmarkTarget[]): v
   ));
 
   if (validTargets.length === 0) {
-    return;
+    return 0;
   }
 
   const tree = buildBookmarkTree(validTargets);
@@ -133,14 +196,16 @@ function writePdfBookmarks(pdfDoc: PDFDocument, targets: PdfBookmarkTarget[]): v
   const outlinesRef = context.register(outlinesDict);
   const result = writeOutlineLevel(pdfDoc, tree, outlinesRef);
 
-  if (result.first && result.last) {
-    outlinesDict.set(PDFName.of("First"), result.first);
-    outlinesDict.set(PDFName.of("Last"), result.last);
-    outlinesDict.set(PDFName.of("Count"), PDFNumber.of(result.count));
+  if (!result.first || !result.last || result.count <= 0) {
+    return 0;
   }
 
+  outlinesDict.set(PDFName.of("First"), result.first);
+  outlinesDict.set(PDFName.of("Last"), result.last);
+  outlinesDict.set(PDFName.of("Count"), PDFNumber.of(result.count));
   pdfDoc.catalog.set(PDFName.of("Outlines"), outlinesRef);
   pdfDoc.catalog.set(PDFName.of("PageMode"), PDFName.of("UseOutlines"));
+  return result.count;
 }
 
 function collectAndRemoveAnchorAnnotations(pdfDoc: PDFDocument): Map<string, AnchorPosition> {
