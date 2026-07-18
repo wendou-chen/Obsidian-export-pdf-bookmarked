@@ -360,36 +360,18 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     return file.extension.toLowerCase() === "pdf" && !file.basename.endsWith(".bookmarked");
   }
 
-  private getOutlineMarkdown(file: TFile): string {
-    const headings = this.getLiveHeadings(file) ?? this.getCachedHeadings(file);
-    return buildOutlineMarkdown(headings, file.basename);
-  }
-
-  private getLiveHeadings(file: TFile): OutlineHeading[] | null {
-    const activeMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!activeMarkdownView?.file || activeMarkdownView.file.path !== file.path) {
-      return null;
-    }
-
-    return parseMarkdownHeadings(activeMarkdownView.getViewData());
-  }
-
-  private getCachedHeadings(file: TFile): OutlineHeading[] {
-    const cache = this.app.metadataCache.getFileCache(file);
-    return (cache?.headings ?? []).map((heading) => ({
-      heading: heading.heading,
-      level: heading.level,
-    }));
+  private async getOutlineMarkdown(file: TFile): Promise<string> {
+    const source = await this.getMarkdownContent(file);
+    return buildOutlineMarkdown(parseMarkdownHeadings(source), file.basename);
   }
 
   private async copyOutlineForFile(file: TFile): Promise<void> {
-    const markdown = this.getOutlineMarkdown(file);
-    if (!markdown) {
-      new Notice("当前 Markdown 文件没有可复制的大纲");
-      return;
-    }
-
     try {
+      const markdown = await this.getOutlineMarkdown(file);
+      if (!markdown) {
+        new Notice("当前 Markdown 文件没有可复制的大纲");
+        return;
+      }
       await navigator.clipboard.writeText(markdown);
       new Notice(`已复制大纲 Markdown：${file.basename}`);
     } catch (error) {
@@ -399,16 +381,15 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   }
 
   private async exportOutlineForFile(file: TFile): Promise<void> {
-    const markdown = this.getOutlineMarkdown(file);
-    if (!markdown) {
-      new Notice("当前 Markdown 文件没有可导出的大纲");
-      return;
-    }
-
-    const exportPath = normalizePath(getOutlineExportPath(file.path));
-    const existing = this.app.vault.getAbstractFileByPath(exportPath);
-
     try {
+      const markdown = await this.getOutlineMarkdown(file);
+      if (!markdown) {
+        new Notice("当前 Markdown 文件没有可导出的大纲");
+        return;
+      }
+
+      const exportPath = normalizePath(getOutlineExportPath(file.path));
+      const existing = this.app.vault.getAbstractFileByPath(exportPath);
       if (existing instanceof TFile) {
         await this.app.vault.modify(existing, `${markdown}\n`);
       } else if (existing) {

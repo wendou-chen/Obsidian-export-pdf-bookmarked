@@ -206,6 +206,7 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
   const frontmatterEndOffset = getFrontmatterEndIndex(markdown);
   let fenceCharacter: "`" | "~" | null = null;
   let fenceLength = 0;
+  let mathBlockOpen = false;
   let htmlBlockEndPattern: HtmlBlockEndPattern | undefined;
   let setextCandidate: SetextCandidate | null = null;
 
@@ -248,6 +249,19 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
     if (openingFence && !hasInvalidBacktickInfo) {
       fenceCharacter = openingFence[1][0] as "`" | "~";
       fenceLength = openingFence[1].length;
+      setextCandidate = null;
+      continue;
+    }
+
+    const mathDelimiterCount = countUnescapedDoubleDollarDelimiters(line.text);
+    if (mathBlockOpen) {
+      if (mathDelimiterCount % 2 === 1) mathBlockOpen = false;
+      setextCandidate = null;
+      continue;
+    }
+
+    if (/^ {0,3}\$\$/.test(line.text)) {
+      mathBlockOpen = mathDelimiterCount % 2 === 1;
       setextCandidate = null;
       continue;
     }
@@ -315,6 +329,21 @@ export function parseMarkdownHeadingRanges(markdown: string): MarkdownHeadingRan
 
 export function parseMarkdownHeadings(markdown: string): OutlineHeading[] {
   return parseMarkdownHeadingRanges(markdown).map(({ heading, level }) => ({ heading, level }));
+}
+
+function countUnescapedDoubleDollarDelimiters(text: string): number {
+  let count = 0;
+  for (let index = 0; index < text.length - 1; index += 1) {
+    if (text[index] !== "$" || text[index + 1] !== "$") continue;
+
+    let precedingBackslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) {
+      precedingBackslashes += 1;
+    }
+    if (precedingBackslashes % 2 === 0) count += 1;
+    index += 1;
+  }
+  return count;
 }
 
 export function locateMarkdownSection(

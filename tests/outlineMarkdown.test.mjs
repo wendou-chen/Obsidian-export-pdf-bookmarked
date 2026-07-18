@@ -484,6 +484,49 @@ try {
   assert.equal(setextHeadings[0].startOffset, 0);
   assert.equal(setextHeadings[0].endOffset, "Setext one\n===========".length);
 
+  const obsidianMathMarkdown = [
+    "# 多元函数积分",
+    "正文里的法向量为",
+    "$$",
+    "\\boldsymbol n",
+    "=",
+    "\\nabla F\\times \\nabla G",
+    "$$",
+    "",
+    "## 下一个真实标题",
+    "行内公式 $$x=y$$ 仍属于普通正文",
+    "---",
+  ].join("\n");
+  assert.deepEqual(parseMarkdownHeadings(obsidianMathMarkdown), [
+    { heading: "多元函数积分", level: 1 },
+    { heading: "下一个真实标题", level: 2 },
+    { heading: "行内公式 $$x=y$$ 仍属于普通正文", level: 2 },
+  ]);
+  const exportedMathOutline = buildOutlineMarkdown(
+    parseMarkdownHeadings(obsidianMathMarkdown),
+    "多元积分概念辨析与公式推导",
+  );
+  assert.equal(exportedMathOutline.includes("\\boldsymbol"), false);
+  assert.equal(exportedMathOutline.includes("\\nabla"), false);
+  assert.equal(exportedMathOutline.split("\n").filter((line) => /^\s*- /.test(line)).length, 3);
+
+  const sameLineMathMarkdown = [
+    "$$E=mc^2$$",
+    "$$\\begin{aligned}",
+    "a",
+    "=",
+    "b",
+    "\\end{aligned}$$",
+    "### 真标题",
+  ].join("\n");
+  assert.deepEqual(parseMarkdownHeadings(sameLineMathMarkdown), [
+    { heading: "真标题", level: 3 },
+  ]);
+
+  assert.deepEqual(parseMarkdownHeadings("\\$\\$ escaped\n---"), [
+    { heading: "\\$\\$ escaped", level: 2 },
+  ]);
+
   const multilineSetextMarkdown = "Foo\nbar\n===\ntail";
   assert.deepEqual(parseMarkdownHeadingRanges(multilineSetextMarkdown), [
     {
