@@ -25,6 +25,11 @@ export interface SectionExportPaths {
   pdfPath: string;
 }
 
+export interface SectionExportFileNames {
+  markdownFileName: string;
+  pdfFileName: string;
+}
+
 export interface PdfBookmarkTarget extends OutlineHeading {
   pageIndex: number;
   top?: number;
@@ -394,6 +399,25 @@ function sectionPathComparisonKey(heading: string): string {
   return sanitizeHeadingPathComponent(heading).toLocaleLowerCase("en-US");
 }
 
+export function getSectionExportFileNames(
+  filePath: string,
+  selection: Pick<MarkdownHeadingRange, "heading" | "ordinal">,
+  appendOrdinal: boolean,
+): SectionExportFileNames {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const slashIndex = normalizedPath.lastIndexOf("/");
+  const fileName = slashIndex >= 0 ? normalizedPath.slice(slashIndex + 1) : normalizedPath;
+  const basename = fileName.replace(/\.md$/i, "");
+  const safeHeading = sanitizeHeadingPathComponent(selection.heading);
+  const ordinalSuffix = appendOrdinal ? `-${selection.ordinal + 1}` : "";
+  const stem = `${basename}--${safeHeading}${ordinalSuffix}`;
+
+  return {
+    markdownFileName: `${stem}.section.md`,
+    pdfFileName: `${stem}.bookmarked.pdf`,
+  };
+}
+
 export function getSectionExportPaths(
   filePath: string,
   selection: Pick<MarkdownHeadingRange, "heading" | "ordinal">,
@@ -402,15 +426,11 @@ export function getSectionExportPaths(
   const normalizedPath = filePath.replace(/\\/g, "/");
   const slashIndex = normalizedPath.lastIndexOf("/");
   const folder = slashIndex >= 0 ? normalizedPath.slice(0, slashIndex + 1) : "";
-  const fileName = slashIndex >= 0 ? normalizedPath.slice(slashIndex + 1) : normalizedPath;
-  const basename = fileName.replace(/\.md$/i, "");
-  const safeHeading = sanitizeHeadingPathComponent(selection.heading);
-  const ordinalSuffix = appendOrdinal ? `-${selection.ordinal + 1}` : "";
-  const stem = `${folder}${basename}--${safeHeading}${ordinalSuffix}`;
+  const fileNames = getSectionExportFileNames(filePath, selection, appendOrdinal);
 
   return {
-    markdownPath: `${stem}.section.md`,
-    pdfPath: `${stem}.bookmarked.pdf`,
+    markdownPath: `${folder}${fileNames.markdownFileName}`,
+    pdfPath: `${folder}${fileNames.pdfFileName}`,
   };
 }
 

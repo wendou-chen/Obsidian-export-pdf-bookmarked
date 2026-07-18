@@ -20,7 +20,7 @@ import {
   getPdfBookmarkHeadings,
   getPrintableBookmarkedPdfMarkdown,
   getPrintableSectionPdfMarkdown,
-  getSectionExportPaths,
+  getSectionExportFileNames,
   locateMarkdownSection,
   parseMarkdownHeadingRanges,
   sliceMarkdownSection,
@@ -40,6 +40,7 @@ import {
   formatBookmarkedExportSuccessNotice,
   getNativeTempMarkdownPath,
   getNativeTempPdfFileName,
+  getSectionDownloadPaths,
   injectPdfBookmarkMarkers,
   isCompleteBookmarkMatch,
   mapPdfBookmarkMarkersToPages,
@@ -48,11 +49,13 @@ import {
   snapshotPdfIncludeName,
   type PdfBookmarkMarker,
   withTimeout,
+  writeExternalFile,
 } from "./nativePdfExport";
 import { registerOutlineSectionMenus, type OutlineHeadingSelection } from "./outlineContextMenu";
 import { SerialTaskQueue } from "./serialTaskQueue";
 
 type CurrentFileAction = "copy" | "export" | "bookmarked-pdf" | "pdf";
+type BinaryOutputWriter = (bytes: Uint8Array) => Promise<void>;
 
 interface SaveDialogResult {
   canceled: boolean;
@@ -65,6 +68,7 @@ interface ElectronDialogLike {
 
 interface ElectronRemoteLike {
   dialog?: ElectronDialogLike;
+  app?: { getPath(name: string): string };
 }
 
 type WindowWithRequire = Window & {
@@ -79,8 +83,15 @@ interface NodeFileSystemLike {
   existsSync(path: string): boolean;
   readFileSync(path: string): Uint8Array;
   promises: {
+    mkdir(path: string, options: { recursive: boolean }): Promise<unknown>;
     unlink(path: string): Promise<void>;
+    writeFile(path: string, data: string | Uint8Array, options?: { encoding?: string }): Promise<void>;
   };
+}
+
+interface NodePathLike {
+  dirname(path: string): string;
+  join(...parts: string[]): string;
 }
 
 interface NodeTimersLike {
@@ -257,18 +268,19 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   }
 
   private async exportOutlineSectionMarkdown(selection: OutlineHeadingSelection): Promise<void> {
+    if (!Platform.isDesktopApp) {
+      new Notice("此节 Markdown 文件导出到 Downloads 仅支持 Obsidian 桌面端");
+      return;
+    }
     try {
       const resolved = await this.resolveSelectedSection(selection);
       if (!resolved) return;
-      const path = normalizePath(getSectionExportPaths(
+      const paths = this.getSectionDownloadsExportPaths(
         selection.file.path, resolved.selected, resolved.appendOrdinal,
-      ).markdownPath);
-      const existing = this.app.vault.getAbstractFileByPath(path);
+      );
       const output = `${resolved.section.replace(/(?:\r?\n)*$/, "")}\n`;
-      if (existing instanceof TFile) await this.app.vault.modify(existing, output);
-      else if (existing) throw new Error(`目标路径不是文件：${path}`);
-      else await this.app.vault.create(path, output);
-      new Notice(`已导出此节 Markdown：${path}`);
+      await this.writeExternalTextFile(paths.markdownPath, output);
+      new Notice(`已导出此节 Markdown：${paths.markdownPath}`, 10000);
     } catch (error) {
       console.error("Failed to export outline section markdown", error);
       new Notice(`导出此节 Markdown 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -285,15 +297,15 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
       if (!resolved) return;
       const printable = getPrintableSectionPdfMarkdown(resolved.section, selection.file.basename);
       const prepared = this.prepareBookmarkedNativeMarkdown(printable);
-      const path = normalizePath(getSectionExportPaths(
+      const paths = this.getSectionDownloadsExportPaths(
         selection.file.path, resolved.selected, resolved.appendOrdinal,
-      ).pdfPath);
+      );
       const bookmarkResult = await this.exportBookmarkedNativePdf(
         selection.file,
         prepared.markdown,
         printable,
         prepared.markers,
-        path,
+        (bytes) => this.writeExternalBinaryFile(paths.pdfPath, bytes),
       );
       if (!isCompleteBookmarkMatch(bookmarkResult.matchedCount, bookmarkResult.expectedCount)) {
         throw new Error(
@@ -304,9 +316,9 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         "section",
         bookmarkResult.matchedCount,
         bookmarkResult.expectedCount,
-        path,
+        paths.pdfPath,
       ), 12000);
-      this.openExportedPdfExternally(path);
+      this.openAbsolutePdfExternally(paths.pdfPath);
     } catch (error) {
       console.error("Failed to export outline section PDF", error);
       new Notice(`导出此节带书签 PDF 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -429,7 +441,7 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         prepared.markdown,
         printableMarkdown,
         prepared.markers,
-        outputPath,
+        (bytes) => this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(bytes)),
       );
 
       if (!isCompleteBookmarkMatch(bookmarkResult.matchedCount, bookmarkResult.expectedCount)) {
@@ -451,17 +463,73 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     }
   }
 
+  private getSectionDownloadsExportPaths(
+    sourcePath: string,
+    selection: Pick<MarkdownHeadingRange, "heading" | "ordinal">,
+    appendOrdinal: boolean,
+  ): { markdownPath: string; pdfPath: string } {
+    const fileNames = getSectionExportFileNames(sourcePath, selection, appendOrdinal);
+    const downloadsDirectory = this.getDownloadsDirectory();
+    const path = this.getNodePathModule();
+    return getSectionDownloadPaths(downloadsDirectory, fileNames, path.join.bind(path));
+  }
+
+  private getDownloadsDirectory(): string {
+    if (!Platform.isDesktopApp) {
+      throw new Error("Downloads 导出仅支持 Obsidian 桌面端");
+    }
+    const remoteDownloads = this.getElectronRemote()?.app?.getPath("downloads");
+    if (remoteDownloads) return remoteDownloads;
+
+    const requireFn = (window as WindowWithRequire).require?.bind(window);
+    if (!requireFn) {
+      throw new Error("无法定位系统 Downloads 文件夹");
+    }
+    const os = requireFn("os") as { homedir(): string };
+    return this.getNodePathModule().join(os.homedir(), "Downloads");
+  }
+
+  private getNodeFileSystem(): NodeFileSystemLike {
+    const requireFn = (window as WindowWithRequire).require?.bind(window);
+    if (!requireFn) {
+      throw new Error("无法访问桌面文件系统");
+    }
+    return requireFn("fs") as NodeFileSystemLike;
+  }
+
+  private getNodePathModule(): NodePathLike {
+    const requireFn = (window as WindowWithRequire).require?.bind(window);
+    if (!requireFn) {
+      throw new Error("无法访问桌面路径模块");
+    }
+    return requireFn("path") as NodePathLike;
+  }
+
+  private async writeExternalTextFile(absolutePath: string, content: string): Promise<void> {
+    this.assertPluginLoaded();
+    const path = this.getNodePathModule();
+    await writeExternalFile(this.getNodeFileSystem(), absolutePath, path.dirname.bind(path), content, "utf8");
+    this.assertPluginLoaded();
+  }
+
+  private async writeExternalBinaryFile(absolutePath: string, bytes: Uint8Array): Promise<void> {
+    this.assertPluginLoaded();
+    const path = this.getNodePathModule();
+    await writeExternalFile(this.getNodeFileSystem(), absolutePath, path.dirname.bind(path), bytes);
+    this.assertPluginLoaded();
+  }
+
   private exportBookmarkedNativePdf(
     file: TFile,
     printableMarkdown: string,
     bookmarkMarkdown: string,
     markers: PdfBookmarkMarker[],
-    outputPath: string,
+    writeOutput: BinaryOutputWriter,
   ): Promise<{ matchedCount: number; expectedCount: number }> {
     return this.pdfExportQueue.run(async () => {
       this.assertPluginLoaded();
       const nativePdfBytes = await this.exportMarkdownWithObsidianNativePdfSerial(file, printableMarkdown);
-      return await this.writeBookmarkedNativePdf(outputPath, nativePdfBytes, bookmarkMarkdown, markers);
+      return await this.writeBookmarkedNativePdf(nativePdfBytes, bookmarkMarkdown, markers, writeOutput);
     });
   }
 
@@ -836,10 +904,10 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
   }
 
   private async writeBookmarkedNativePdf(
-    outputPath: string,
     nativePdfBytes: Uint8Array,
     markdown: string,
     markers: PdfBookmarkMarker[],
+    writeOutput: BinaryOutputWriter,
   ): Promise<{ matchedCount: number; expectedCount: number }> {
     this.assertPluginLoaded();
     if (markers.length === 0) {
@@ -855,14 +923,14 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
     await assertCatalogHasOutlines(finalized.bytes, finalized.matchedCount);
 
     this.assertPluginLoaded();
-    await this.writeBinaryVaultFile(outputPath, this.toArrayBuffer(finalized.bytes));
+    await writeOutput(finalized.bytes);
     return {
       matchedCount: finalized.matchedCount,
       expectedCount: finalized.expectedCount,
     };
   }
 
-  /** Open with the OS default PDF app so native outlines are visible (Obsidian viewer often hides them). */
+  /** Resolve a Vault-relative PDF and open it with the OS default PDF app. */
   private openExportedPdfExternally(vaultRelativePath: string): void {
     try {
       const adapter = this.app.vault.adapter;
@@ -873,13 +941,22 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         );
         return;
       }
-      const absolutePath = adapter.getFullPath(vaultRelativePath);
+      this.openAbsolutePdfExternally(adapter.getFullPath(vaultRelativePath));
+    } catch (error) {
+      console.warn("Failed to resolve exported PDF path", error);
+      new Notice(
+        `PDF 已写入：${vaultRelativePath}。自动打开失败，请手动用 Edge/Sumatra/Adobe 打开左侧书签`,
+        12000,
+      );
+    }
+  }
+
+  /** Open an absolute PDF path, including section exports stored outside the Vault. */
+  private openAbsolutePdfExternally(absolutePath: string): void {
+    try {
       const requireFn = (window as WindowWithRequire).require?.bind(window);
       if (!requireFn) {
-        new Notice(
-          `PDF 已写入：${vaultRelativePath}。请手动用外部阅读器打开查看书签`,
-          12000,
-        );
+        new Notice(`PDF 已写入：${absolutePath}。请手动用外部阅读器打开查看书签`, 12000);
         return;
       }
       const electron = requireFn("electron") as {
@@ -905,14 +982,11 @@ export default class OutlineMarkdownExportPlugin extends Plugin {
         childProcess.execFile("cmd", ["/c", "start", "", absolutePath]);
         return;
       }
-      new Notice(
-        `PDF 已写入：${absolutePath}。请手动用外部阅读器打开查看书签`,
-        12000,
-      );
+      new Notice(`PDF 已写入：${absolutePath}。请手动用外部阅读器打开查看书签`, 12000);
     } catch (error) {
       console.warn("Failed to open exported PDF externally", error);
       new Notice(
-        `PDF 已写入：${vaultRelativePath}。自动打开失败，请手动用 Edge/Sumatra/Adobe 打开左侧书签`,
+        `PDF 已写入：${absolutePath}。自动打开失败，请手动用 Edge/Sumatra/Adobe 打开左侧书签`,
         12000,
       );
     }

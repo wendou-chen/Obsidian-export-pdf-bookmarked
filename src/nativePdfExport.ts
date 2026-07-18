@@ -25,6 +25,44 @@ export interface PdfBookmarkMarkerTarget {
   pageIndex: number;
 }
 
+export interface SectionDownloadFileNames {
+  markdownFileName: string;
+  pdfFileName: string;
+}
+
+export function getSectionDownloadPaths(
+  downloadsDirectory: string,
+  fileNames: SectionDownloadFileNames,
+  joinPath: (...parts: string[]) => string,
+): { markdownPath: string; pdfPath: string } {
+  return {
+    markdownPath: joinPath(downloadsDirectory, fileNames.markdownFileName),
+    pdfPath: joinPath(downloadsDirectory, fileNames.pdfFileName),
+  };
+}
+
+export interface ExternalFileSystemWriter {
+  promises: {
+    mkdir(path: string, options: { recursive: boolean }): Promise<unknown>;
+    writeFile(path: string, data: string | Uint8Array, options?: { encoding?: string }): Promise<void>;
+  };
+}
+
+export async function writeExternalFile(
+  fileSystem: ExternalFileSystemWriter,
+  absolutePath: string,
+  dirname: (path: string) => string,
+  data: string | Uint8Array,
+  encoding?: string,
+): Promise<void> {
+  await fileSystem.promises.mkdir(dirname(absolutePath), { recursive: true });
+  await fileSystem.promises.writeFile(
+    absolutePath,
+    data,
+    encoding ? { encoding } : undefined,
+  );
+}
+
 function sanitizeToken(token: string): string {
   return token.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "temp";
 }

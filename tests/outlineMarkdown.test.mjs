@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { build } from "esbuild";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -67,6 +67,7 @@ try {
     getPdfBookmarkHeadings,
     getPrintableBookmarkedPdfMarkdown,
     getPrintableSectionPdfMarkdown,
+    getSectionExportFileNames,
     getSectionExportPaths,
     hasPdfOutlines,
     locateMarkdownSection,
@@ -83,6 +84,7 @@ try {
     formatBookmarkedExportSuccessNotice,
     getNativeTempMarkdownPath,
     getNativeTempPdfFileName,
+    getSectionDownloadPaths,
     injectPdfBookmarkMarkers,
     isCompleteBookmarkMatch,
     mapPdfBookmarkMarkersToPages,
@@ -91,6 +93,7 @@ try {
     shouldRetryNativeTempPdfCleanup,
     snapshotPdfIncludeName,
     withTimeout,
+    writeExternalFile,
   } = await import(pathToFileURL(nativePdfBundlePath).href);
   const { PDFDocument, PDFName, PDFString } = await import("pdf-lib");
   const {
@@ -233,6 +236,23 @@ try {
   assert.equal(shouldRetryNativeTempPdfCleanup({ code: "EPERM" }), true);
   assert.equal(shouldRetryNativeTempPdfCleanup({ code: "ENOENT" }), false);
   assert.equal(shouldRetryNativeTempPdfCleanup(new Error("unknown")), false);
+  const externalMarkdownPath = path.join(tempDir, "Downloads", "section.md");
+  await writeExternalFile(
+    { promises: { mkdir, writeFile } },
+    externalMarkdownPath,
+    path.dirname,
+    "# Section\n",
+    "utf8",
+  );
+  assert.equal(await readFile(externalMarkdownPath, "utf8"), "# Section\n");
+  const externalPdfPath = path.join(tempDir, "Downloads", "section.pdf");
+  await writeExternalFile(
+    { promises: { mkdir, writeFile } },
+    externalPdfPath,
+    path.dirname,
+    new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+  );
+  assert.deepEqual(new Uint8Array(await readFile(externalPdfPath)), new Uint8Array([0x25, 0x50, 0x44, 0x46]));
   await assert.rejects(
     withTimeout(new Promise(() => undefined), 10, "原生导出超时"),
     /原生导出超时/,
@@ -884,6 +904,27 @@ try {
     {
       markdownPath: "notes/source--Bad title.section.md",
       pdfPath: "notes/source--Bad title.bookmarked.pdf",
+    },
+  );
+  assert.deepEqual(
+    getSectionDownloadPaths(
+      "C:\\Users\\admin\\Downloads",
+      {
+        markdownFileName: "source--Repeat-2.section.md",
+        pdfFileName: "source--Repeat-2.bookmarked.pdf",
+      },
+      path.win32.join,
+    ),
+    {
+      markdownPath: "C:\\Users\\admin\\Downloads\\source--Repeat-2.section.md",
+      pdfPath: "C:\\Users\\admin\\Downloads\\source--Repeat-2.bookmarked.pdf",
+    },
+  );
+  assert.deepEqual(
+    getSectionExportFileNames("notes/source.md", { heading: "Repeat", ordinal: 1 }, true),
+    {
+      markdownFileName: "source--Repeat-2.section.md",
+      pdfFileName: "source--Repeat-2.bookmarked.pdf",
     },
   );
   assert.deepEqual(

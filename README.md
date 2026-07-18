@@ -35,10 +35,12 @@
 
 区段从被右击的标题开始，包含标题本身、正文和所有更深层级的后代标题；在下一个同级或更高级标题之前结束。如果后面没有这样的标题，则持续到文件末尾。插件原样保留所选 Markdown，不重新编号或降低标题层级。
 
-导出文件与源笔记放在同一目录：
+单节导出文件写入系统 **Downloads** 文件夹（Windows 通常为 `C:\Users\<用户名>\Downloads`），便于即用即删：
 
-- Markdown：`源文件名--标题.section.md`
-- PDF：`源文件名--标题.bookmarked.pdf`
+- Markdown：`Downloads\源文件名--标题.section.md`
+- PDF：`Downloads\源文件名--标题.bookmarked.pdf`
+
+整篇大纲 Markdown 和整篇带书签 PDF 仍写入源笔记所在目录。
 
 文件名中的非法字符和多余空白会被安全清理。若重复标题或清理后的标题会产生同名文件，文件名会在扩展名前追加该标题在全文中的 1-based 序号，以稳定区分不同区段；再次导出同一区段会覆盖对应文件。
 
@@ -60,7 +62,7 @@
 | 导出带书签 PDF | **推荐主路径**：内部完成原生打印 + 唯一标记定位 + 书签写入，一次生成 `*.bookmarked.pdf`。成功 Notice 会显示 `matched/expected`；任一书签未匹配则失败且不写最终文件。 |
 | 给已有 PDF 注入书签（尽力匹配，非一键导出） | **次路径/兼容**：对已有原生 PDF 按标题文本尽力匹配。可能部分命中、页码不准；不保证与一键导出同等质量。 |
 
-PDF 相关命令依赖 Electron 的 PDF 导出能力，因此需要在 Obsidian 桌面端使用。移动端仍可使用单节 Markdown 的复制和导出功能。
+PDF 相关命令及单节文件写入系统 Downloads 依赖桌面文件系统，因此需要在 Obsidian 桌面端使用。移动端仍可使用“复制此节 Markdown”。
 
 ## 为什么需要这个插件
 
@@ -108,7 +110,7 @@ npm test
 - PDF 导出命令和单节带书签 PDF 需要 Obsidian 桌面端。
 - 书签来自 Markdown 标题，默认只写入 **H1–H3**（更深标题不会进 PDF 大纲）。
 - **一键导出契约**：书签必须全部匹配成功才写入 `*.bookmarked.pdf`；匹配不全会明确失败，不会留下“无书签却叫 bookmarked”的文件。
-- 输出文件在**源笔记同一目录**，命名为 `*.bookmarked.pdf` 或 `源文件名--标题.bookmarked.pdf`；不在桌面或临时目录。
+- 整篇 `*.bookmarked.pdf` 保留在源笔记目录；单节 `.section.md` 与 `.bookmarked.pdf` 写入系统 Downloads 文件夹。
 - 查看书签请优先用 **Edge / SumatraPDF / Adobe** 等外部阅读器打开左侧大纲；Obsidian 内置 PDF 查看器不一定显示 `/Outlines`。
 - 导出期间可能短暂无响应，来自 Obsidian 原生 `printToPdf` 布局，不是书签算法本身。
 - 「给已有 PDF 注入书签」按页面文本匹配标题，属于尽力而为；扫描版、纯图 PDF 或正文同名词可能导致错页，推荐改用「导出带书签 PDF」。
